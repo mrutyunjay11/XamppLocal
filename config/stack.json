@@ -1,0 +1,20 @@
+{
+  "httpd_bin": "/usr/sbin/httpd",
+  "httpd_root": "/usr",
+  "httpd_modules_dir": "libexec/apache2",
+  "rotatelogs_bin": "/usr/sbin/rotatelogs",
+  "mime_types_file": "/etc/apache2/mime.types",
+  "php_formula": "php",
+  "http_port": 8080,
+  "pma_port": 8081,
+  "web_root": "/Users/mrutyunjayjoshi/Sites/Xampp",
+  "recent_web_roots": [
+    "/Users/mrutyunjayjoshi/Sites/Xampp"
+  ],
+  "db_engine": "mysql",
+  "db_profile": "default",
+  "mysql_source": "tarball",
+  "mysql_dir": "~/Library/Application Support/XamppLocal/engines/mysql-8.4",
+  "mariadb_formula": "mariadb",
+  "postgresql_formula": "postgresql@18"
+}

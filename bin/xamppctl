@@ -1,0 +1,1658 @@
+#!/usr/bin/env python3
+"""
+xamppctl - Single-source-of-truth lifecycle & database controller for native arm64 XamppLocal.
+Supports:
+  - Built-in macOS Apache (/usr/sbin/httpd, mpm_event) + Homebrew PHP-FPM (php 8.4.8, unlinked/pinned)
+  - Default MySQL 8.4 LTS (tarball zero-touch or explicit Homebrew mysql@8.4)
+  - On-demand optional DBs: MariaDB, PostgreSQL 18 (must be installed & selected before use), SQLite 3 (built-in)
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+APP_SUPPORT = Path.home() / "Library" / "Application Support" / "XamppLocal"
+WEB_ROOT = Path.home() / "Sites" / "Xampp"
+CONFIG_DIR = PROJECT_ROOT / "config"
+IN_APP_BUNDLE = ".app/Contents/Resources/" in str(PROJECT_ROOT)
+MUTABLE_CONFIG_DIR = (APP_SUPPORT / "config") if IN_APP_BUNDLE else CONFIG_DIR
+STACK_JSON = MUTABLE_CONFIG_DIR / "stack.json"
+VHOSTS_DIR = MUTABLE_CONFIG_DIR / "vhosts.d" if IN_APP_BUNDLE else (CONFIG_DIR / "httpd" / "vhosts.d")
+
+DATA_DIR = APP_SUPPORT / "data"
+RUN_DIR = APP_SUPPORT / "run"
+GENERATED_DIR = RUN_DIR / "generated"
+LOGS_DIR = APP_SUPPORT / "logs"
+TMP_DIR = APP_SUPPORT / "tmp"
+PMA_TMP_DIR = TMP_DIR / "phpmyadmin"
+ENGINES_DIR = APP_SUPPORT / "engines"
+STATE_LOCK = APP_SUPPORT / "state.lock"
+BASELINE_BREW_FILE = LOGS_DIR / "baseline-brew-versions.txt"
+
+MAX_UNIX_SOCKET_BYTES = 104
+DB_PROFILES = {
+    "default": {
+        "INNODB_BUFFER_POOL_SIZE": "64M",
+        "INNODB_FLUSH_TRX": "1",
+        "MAX_CONNECTIONS": "20",
+        "TABLE_OPEN_CACHE": "128",
+        "MAX_ALLOWED_PACKET": "64M",
+        "PG_SHARED_BUFFERS": "32MB",
+        "PG_SYNC_COMMIT": "on",
+    },
+    "eco": {
+        "INNODB_BUFFER_POOL_SIZE": "32M",
+        "INNODB_FLUSH_TRX": "1",
+        "MAX_CONNECTIONS": "15",
+        "TABLE_OPEN_CACHE": "64",
+        "MAX_ALLOWED_PACKET": "32M",
+        "PG_SHARED_BUFFERS": "16MB",
+        "PG_SYNC_COMMIT": "on",
+    },
+    "import": {
+        "INNODB_BUFFER_POOL_SIZE": "256M",
+        "INNODB_FLUSH_TRX": "2",
+        "MAX_CONNECTIONS": "20",
+        "TABLE_OPEN_CACHE": "256",
+        "MAX_ALLOWED_PACKET": "256M",
+        "PG_SHARED_BUFFERS": "128MB",
+        "PG_SYNC_COMMIT": "off",
+    },
+}
+
+DEFAULT_STACK = {
+    "httpd_bin": "/usr/sbin/httpd",
+    "httpd_root": "/usr",
+    "httpd_modules_dir": "libexec/apache2",
+    "rotatelogs_bin": "/usr/sbin/rotatelogs",
+    "mime_types_file": "/etc/apache2/mime.types",
+    "php_formula": "php",
+    "http_port": 8080,
+    "pma_port": 8081,
+    "web_root": "~/Sites/Xampp",
+    "recent_web_roots": ["~/Sites/Xampp"],
+    "db_engine": "mysql",
+    "db_profile": "default",
+    "mysql_source": "tarball",
+    "mysql_dir": "~/Library/Application Support/XamppLocal/engines/mysql-8.4",
+    "mariadb_formula": "mariadb",
+    "postgresql_formula": "postgresql@18",
+}
+
+
+class XamppError(Exception):
+    def __init__(self, message: str, code: int = 1) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def detect_timezone() -> str:
+    try:
+        resolved = os.path.realpath("/etc/localtime")
+        if "/zoneinfo/" in resolved:
+            tz = resolved.split("/zoneinfo/", 1)[1].strip()
+            if tz:
+                return tz
+    except OSError:
+        pass
+    return "UTC"
+
+
+def get_web_root(stack: dict[str, Any]) -> Path:
+    raw = str(stack.get("web_root") or WEB_ROOT)
+    return expand(raw).resolve()
+
+
+def validate_stack(stack: dict[str, Any]) -> dict[str, Any]:
+    port = stack.get("http_port", 8080)
+    pma_port = stack.get("pma_port", 8081)
+    if not isinstance(port, int) or isinstance(port, bool) or not (1024 <= port <= 65535):
+        raise XamppError(f"Invalid http_port in stack.json: {port!r} (must be integer 1024..65535)", 1)
+    if not isinstance(pma_port, int) or isinstance(pma_port, bool) or not (1024 <= pma_port <= 65535) or pma_port == port:
+        raise XamppError(f"Invalid pma_port in stack.json: {pma_port!r} (must be integer 1024..65535 and != http_port)", 1)
+    if stack.get("db_engine") not in ("mysql", "mariadb", "postgresql", "sqlite"):
+        raise XamppError(f"Invalid db_engine in stack.json: {stack.get('db_engine')!r}", 1)
+    if stack.get("db_profile") not in DB_PROFILES:
+        raise XamppError(f"Invalid db_profile in stack.json: {stack.get('db_profile')!r}", 1)
+    for key in ("php_formula", "mariadb_formula", "postgresql_formula"):
+        val = str(stack.get(key, ""))
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9@._-]*", val):
+            raise XamppError(f"Invalid Homebrew formula name for {key}: {val!r}", 1)
+    for key in ("httpd_bin", "httpd_root", "httpd_modules_dir", "rotatelogs_bin", "mime_types_file", "mysql_dir"):
+        val = str(stack.get(key, ""))
+        if any(ch in val for ch in ('\n', '\r', '"', "'", "\x00")):
+            raise XamppError(f"Unsafe characters in stack.json field {key}", 1)
+    return stack
+
+
+def load_stack() -> dict[str, Any]:
+    if not STACK_JSON.exists():
+        return dict(DEFAULT_STACK)
+    try:
+        data = json.loads(STACK_JSON.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise XamppError(f"Corrupt config/stack.json: {exc}", 1) from exc
+    if not isinstance(data, dict):
+        raise XamppError("config/stack.json must be a JSON object.", 1)
+    merged = dict(DEFAULT_STACK)
+    merged.update(data)
+    return validate_stack(merged)
+
+
+def save_stack(stack: dict[str, Any]) -> None:
+    STACK_JSON.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STACK_JSON.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(stack, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, STACK_JSON)
+
+
+def ensure_dirs() -> None:
+    os.umask(0o077)
+    for d, mode in [
+        (APP_SUPPORT, 0o700),
+        (DATA_DIR, 0o700),
+        (RUN_DIR, 0o700),
+        (GENERATED_DIR, 0o700),
+        (LOGS_DIR, 0o700),
+        (LOGS_DIR / "bench", 0o700),
+        (TMP_DIR, 0o700),
+        (PMA_TMP_DIR, 0o700),
+        (APP_SUPPORT / "apps", 0o700),
+        (ENGINES_DIR, 0o700),
+        (WEB_ROOT, 0o700),
+        (MUTABLE_CONFIG_DIR, 0o755),
+        (VHOSTS_DIR, 0o755),
+    ]:
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(d, mode)
+        except PermissionError:
+            pass
+    for log_file in LOGS_DIR.glob("*.log*"):
+        if log_file.is_file():
+            try:
+                os.chmod(log_file, 0o600)
+            except PermissionError:
+                pass
+
+
+@contextmanager
+def advisory_lock(exclusive: bool = True):
+    ensure_dirs()
+    fd = os.open(STATE_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def expand(path_str: str) -> Path:
+    return Path(os.path.expanduser(path_str))
+
+
+def php_paths(stack: dict[str, Any]) -> dict[str, Path]:
+    base = Path("/opt/homebrew/opt") / stack["php_formula"]
+    return {
+        "php": base / "bin" / "php",
+        "php_fpm": base / "sbin" / "php-fpm",
+    }
+
+
+def db_binary_paths(stack: dict[str, Any], engine: str) -> dict[str, Path]:
+    if engine == "mysql":
+        if stack.get("mysql_source") == "tarball":
+            base = expand(stack.get("mysql_dir", str(ENGINES_DIR / "mysql-8.4")))
+        else:
+            base = Path("/opt/homebrew/opt/mysql@8.4")
+        return {
+            "base": base,
+            "daemon": base / "bin" / "mysqld",
+            "client": base / "bin" / "mysql",
+            "admin": base / "bin" / "mysqladmin",
+        }
+    if engine == "mariadb":
+        base = Path("/opt/homebrew/opt") / stack.get("mariadb_formula", "mariadb")
+        return {
+            "base": base,
+            "daemon": base / "bin" / "mariadbd",
+            "client": base / "bin" / "mariadb",
+            "admin": base / "bin" / "mariadb-admin",
+            "install_db": base / "bin" / "mariadb-install-db",
+        }
+    if engine == "postgresql":
+        base = Path("/opt/homebrew/opt") / stack.get("postgresql_formula", "postgresql@18")
+        return {
+            "base": base,
+            "daemon": base / "bin" / "postgres",
+            "pg_ctl": base / "bin" / "pg_ctl",
+            "initdb": base / "bin" / "initdb",
+            "client": base / "bin" / "psql",
+            "isready": base / "bin" / "pg_isready",
+        }
+    if engine == "sqlite":
+        p = php_paths(stack)["php"]
+        return {"daemon": p, "client": Path("/usr/bin/sqlite3")}
+    raise XamppError(f"Unknown database engine: {engine}", 1)
+
+
+def is_engine_installed(stack: dict[str, Any], engine: str) -> bool:
+    if engine == "sqlite":
+        return php_paths(stack)["php"].exists()
+    paths = db_binary_paths(stack, engine)
+    return paths["daemon"].exists() and os.access(paths["daemon"], os.X_OK)
+
+
+def get_engine_port(engine: str) -> int | None:
+    if engine in ("mysql", "mariadb"):
+        return 3306
+    if engine == "postgresql":
+        return 5432
+    return None
+
+
+def get_engine_socket(engine: str) -> Path | None:
+    if engine in ("mysql", "mariadb"):
+        return RUN_DIR / "mysql.sock"
+    if engine == "postgresql":
+        return RUN_DIR / ".s.PGSQL.5432"
+    return None
+
+
+def read_pid(pid_file: Path) -> int | None:
+    if not pid_file.exists():
+        return None
+    raw = pid_file.read_text(encoding="utf-8").strip().splitlines()
+    if not raw:
+        return None
+    try:
+        pid = int(raw[0].strip())
+        return pid if pid > 1 else None
+    except ValueError:
+        return None
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError as exc:
+        return exc.errno == errno.EPERM
+
+
+def pid_comm(pid: int) -> str:
+    res = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "ucomm="],
+        capture_output=True,
+        text=True,
+    )
+    return res.stdout.strip()
+
+
+def service_pid_status(pid_file: Path, expected_names: tuple[str, ...]) -> tuple[bool, int | None]:
+    pid = read_pid(pid_file)
+    if pid is None:
+        return False, None
+    if not pid_alive(pid):
+        return False, None
+    comm = pid_comm(pid).lower()
+    if comm and comm in expected_names:
+        return True, pid
+    # PID was recycled by OS for a different binary
+    return False, None
+
+
+def cleanup_stale_pid_and_socket(pid_file: Path, sock_file: Path | None, expected_names: tuple[str, ...]) -> int | None:
+    alive, pid = service_pid_status(pid_file, expected_names)
+    if alive and pid is not None:
+        return pid
+    if pid_file.exists():
+        pid_file.unlink(missing_ok=True)
+    if sock_file is not None and sock_file.exists():
+        sock_file.unlink(missing_ok=True)
+    return None
+
+
+def port_owner(port: int) -> tuple[int, str] | None:
+    res = subprocess.run(
+        ["/usr/sbin/lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-F", "pcn"],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0 or not res.stdout.strip():
+        return None
+    pid = None
+    cmd = "unknown"
+    for line in res.stdout.splitlines():
+        if line.startswith("p") and pid is None:
+            try:
+                pid = int(line[1:])
+            except ValueError:
+                pass
+        elif line.startswith("c"):
+            cmd = line[1:]
+            break
+    return (pid, cmd) if pid else None
+
+
+def check_port_free(port: int, allowed_pid: int | None = None, label: str = "service") -> None:
+    owner = port_owner(port)
+    if owner is None:
+        return
+    pid, cmd = owner
+    if allowed_pid is not None and pid == allowed_pid:
+        return
+    raise XamppError(
+        f"Port 127.0.0.1:{port} required by {label} is already in use by '{cmd}' (PID {pid}).",
+        1,
+    )
+
+
+def ensure_blowfish_secret() -> Path:
+    secret_file = PMA_TMP_DIR / "blowfish.secret"
+    if not secret_file.exists() or len(secret_file.read_text(encoding="utf-8").strip()) < 32:
+        secret_file.write_text(secrets.token_hex(16) + "\n", encoding="utf-8")
+    os.chmod(secret_file, 0o600)
+    return secret_file
+
+
+def render_template(src: Path, dst: Path, mapping: dict[str, str]) -> Path:
+    text = src.read_text(encoding="utf-8")
+    for k, v in mapping.items():
+        text = text.replace("{{" + k + "}}", v)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(text, encoding="utf-8")
+    return dst
+
+
+def render_configs(stack: dict[str, Any]) -> dict[str, Path]:
+    ensure_dirs()
+    ensure_blowfish_secret()
+    profile_name = stack.get("db_profile", "default")
+    if profile_name not in DB_PROFILES:
+        raise XamppError(f"Unknown db_profile '{profile_name}'. Expected default, eco, or import.")
+    profile_vars = DB_PROFILES[profile_name]
+
+    active_web_root = get_web_root(stack)
+    vars_map = {
+        "PROJECT_ROOT": str(PROJECT_ROOT),
+        "WEB_ROOT": str(active_web_root),
+        "APP_SUPPORT": str(APP_SUPPORT),
+        "HTTPD_ROOT": stack["httpd_root"],
+        "HTTPD_MODULES_DIR": stack["httpd_modules_dir"],
+        "ROTATELOGS_BIN": stack["rotatelogs_bin"],
+        "MIME_TYPES_FILE": stack["mime_types_file"],
+        "HTTP_PORT": str(stack["http_port"]),
+        "PMA_PORT": str(stack["pma_port"]),
+        "TIMEZONE": detect_timezone(),
+        **profile_vars,
+    }
+
+    if active_web_root == WEB_ROOT.resolve():
+        active_web_root.mkdir(parents=True, exist_ok=True)
+    meta_file = GENERATED_DIR / "runtime_meta.json"
+    meta_file.write_text(
+        json.dumps(
+            {
+                "db_engine": stack["db_engine"],
+                "db_profile": profile_name,
+                "pma_port": int(stack["pma_port"]),
+                "web_root": str(active_web_root),
+                "project_root": str(PROJECT_ROOT),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    httpd_conf = render_template(CONFIG_DIR / "httpd" / "httpd.conf.tmpl", GENERATED_DIR / "httpd.conf", vars_map)
+
+    vhosts_chunks = ["# Rendered vhosts from vhosts.d/*.conf\n"]
+    if VHOSTS_DIR.exists():
+        for vf in sorted(VHOSTS_DIR.glob("*.conf")):
+            vhosts_chunks.append(f"# --- {vf.name} ---\n" + vf.read_text(encoding="utf-8") + "\n")
+    (GENERATED_DIR / "vhosts.conf").write_text("\n".join(vhosts_chunks), encoding="utf-8")
+
+    pma_conf_dst = GENERATED_DIR / "phpmyadmin.conf"
+    if stack["db_engine"] in ("mysql", "mariadb"):
+        render_template(CONFIG_DIR / "httpd" / "phpmyadmin.conf.tmpl", pma_conf_dst, vars_map)
+        render_template(
+            CONFIG_DIR / "phpmyadmin" / "config.inc.php.tmpl",
+            GENERATED_DIR / "phpmyadmin.inc.php",
+            vars_map,
+        )
+    else:
+        pma_conf_dst.write_text(
+            f"# phpMyAdmin disabled while active db_engine is '{stack['db_engine']}'\n",
+            encoding="utf-8",
+        )
+
+    php_ini = render_template(CONFIG_DIR / "php" / "php.ini.tmpl", GENERATED_DIR / "php.ini", vars_map)
+    php_fpm_conf = render_template(CONFIG_DIR / "php" / "php-fpm.conf.tmpl", GENERATED_DIR / "php-fpm.conf", vars_map)
+
+    rendered = {
+        "httpd_conf": httpd_conf,
+        "php_ini": php_ini,
+        "php_fpm_conf": php_fpm_conf,
+    }
+
+    engine = stack["db_engine"]
+    if engine == "mysql":
+        rendered["db_conf"] = render_template(CONFIG_DIR / "mysql" / "my.cnf.tmpl", GENERATED_DIR / "my.cnf", vars_map)
+    elif engine == "mariadb":
+        rendered["db_conf"] = render_template(CONFIG_DIR / "mariadb" / "my.cnf.tmpl", GENERATED_DIR / "my.cnf", vars_map)
+    elif engine == "postgresql":
+        rendered["db_conf"] = render_template(
+            CONFIG_DIR / "postgresql" / "postgresql.conf.tmpl",
+            GENERATED_DIR / "postgresql.conf",
+            vars_map,
+        )
+    return rendered
+
+
+def check_file_arm64(path: Path) -> bool:
+    if not path.exists():
+        return False
+    res = subprocess.run(["/usr/bin/file", str(path)], capture_output=True, text=True)
+    return "arm64" in res.stdout
+
+
+def rotate_log_if_needed(log_path: Path, max_bytes: int = 10 * 1024 * 1024, keep: int = 3) -> None:
+    if not log_path.exists():
+        return
+    try:
+        if log_path.stat().st_size <= max_bytes:
+            return
+    except OSError:
+        return
+    for i in range(keep - 1, 0, -1):
+        older = log_path.with_name(f"{log_path.name}.{i}")
+        newer = log_path.with_name(f"{log_path.name}.{i + 1}")
+        if older.exists():
+            os.replace(older, newer)
+    os.replace(log_path, log_path.with_name(f"{log_path.name}.1"))
+
+
+def validate_configs(stack: dict[str, Any], rendered: dict[str, Path], check_php: bool, check_httpd: bool, check_db: bool) -> None:
+    if check_httpd:
+        res = subprocess.run(
+            [stack["httpd_bin"], "-f", str(rendered["httpd_conf"]), "-t"],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode != 0:
+            raise XamppError(f"Apache config validation failed:\n{res.stderr or res.stdout}", 1)
+
+    if check_php:
+        fpm_bin = php_paths(stack)["php_fpm"]
+        if not fpm_bin.exists():
+            raise XamppError(f"php-fpm not found at {fpm_bin}", 1)
+        res = subprocess.run(
+            [str(fpm_bin), "-y", str(rendered["php_fpm_conf"]), "-c", str(rendered["php_ini"]), "-t"],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode != 0:
+            raise XamppError(f"PHP-FPM config validation failed:\n{res.stderr or res.stdout}", 1)
+
+    if check_db:
+        engine = stack["db_engine"]
+        if engine == "mysql":
+            daemon = db_binary_paths(stack, "mysql")["daemon"]
+            res = subprocess.run(
+                [str(daemon), f"--defaults-file={rendered['db_conf']}", "--validate-config"],
+                capture_output=True,
+                text=True,
+            )
+            if res.returncode != 0:
+                raise XamppError(f"MySQL config validation failed:\n{res.stderr or res.stdout}", 1)
+        elif engine == "mariadb":
+            daemon = db_binary_paths(stack, "mariadb")["daemon"]
+            res = subprocess.run(
+                [str(daemon), f"--defaults-file={rendered['db_conf']}", "--help", "--verbose"],
+                capture_output=True,
+                text=True,
+            )
+            if res.returncode != 0:
+                raise XamppError(f"MariaDB config validation failed:\n{res.stderr or res.stdout}", 1)
+        elif engine == "postgresql":
+            daemon = db_binary_paths(stack, "postgresql")["daemon"]
+            datadir = DATA_DIR / "postgresql"
+            if datadir.exists() and (datadir / "PG_VERSION").exists():
+                res = subprocess.run(
+                    [str(daemon), "-D", str(datadir), "-c", f"config_file={rendered['db_conf']}", "-C", "shared_buffers"],
+                    capture_output=True,
+                    text=True,
+                )
+                if res.returncode != 0:
+                    raise XamppError(f"PostgreSQL config validation failed:\n{res.stderr or res.stdout}", 1)
+
+
+def ensure_datadir_initialized(stack: dict[str, Any], rendered: dict[str, Path], engine: str) -> Path:
+    if engine == "sqlite":
+        return DATA_DIR
+    datadir = DATA_DIR / engine
+    datadir.mkdir(parents=True, exist_ok=True)
+    os.chmod(datadir, 0o700)
+
+    marker = datadir / ".engine"
+    entries = [p for p in datadir.iterdir() if p.name not in (".DS_Store", ".engine")]
+    if marker.exists():
+        found = marker.read_text(encoding="utf-8").strip()
+        if found != engine:
+            raise XamppError(
+                f"REFUSED: {datadir} belongs to '{found}', cannot start '{engine}' on it!",
+                1,
+            )
+        if entries:
+            return datadir
+    elif entries:
+        raise XamppError(
+            f"REFUSED: {datadir} is non-empty and missing '.engine' marker. Will not risk corrupting unknown data.",
+            1,
+        )
+
+    print(f"Initializing fresh {engine} datadir at {datadir}...")
+    paths = db_binary_paths(stack, engine)
+    if engine == "mysql":
+        res = subprocess.run(
+            [
+                str(paths["daemon"]),
+                f"--defaults-file={rendered['db_conf']}",
+                "--initialize-insecure",
+                f"--datadir={datadir}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode != 0:
+            raise XamppError(f"MySQL initialization failed:\n{res.stderr or res.stdout}", 1)
+    elif engine == "mariadb":
+        res = subprocess.run(
+            [
+                str(paths["install_db"]),
+                f"--defaults-file={rendered['db_conf']}",
+                f"--datadir={datadir}",
+                "--auth-root-authentication-method=normal",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode != 0:
+            raise XamppError(f"MariaDB initialization failed:\n{res.stderr or res.stdout}", 1)
+    elif engine == "postgresql":
+        res = subprocess.run(
+            [
+                str(paths["initdb"]),
+                "-D",
+                str(datadir),
+                "-U",
+                "postgres",
+                "--auth=trust",
+                "--encoding=UTF8",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode != 0:
+            raise XamppError(f"PostgreSQL initdb failed:\n{res.stderr or res.stdout}", 1)
+
+    marker.write_text(engine + "\n", encoding="utf-8")
+    return datadir
+
+
+def wait_for(predicate, timeout_s: float, step_s: float = 0.15) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(step_s)
+    return bool(predicate())
+
+
+def tcp_open(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.4):
+            return True
+    except OSError:
+        return False
+
+
+def start_php_fpm(stack: dict[str, Any], rendered: dict[str, Path]) -> None:
+    pid_file = RUN_DIR / "php-fpm.pid"
+    sock_file = RUN_DIR / "php-fpm.sock"
+    existing = cleanup_stale_pid_and_socket(pid_file, sock_file, ("php-fpm",))
+    if existing:
+        print(f"php-fpm already running (PID {existing}).")
+        return
+
+    rotate_log_if_needed(LOGS_DIR / "php-fpm.log")
+    rotate_log_if_needed(LOGS_DIR / "php-error.log")
+
+    fpm_bin = php_paths(stack)["php_fpm"]
+    res = subprocess.run(
+        [str(fpm_bin), "-y", str(rendered["php_fpm_conf"]), "-c", str(rendered["php_ini"])],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        raise XamppError(f"Failed to start php-fpm:\n{res.stderr or res.stdout}", 1)
+
+    ok = wait_for(lambda: sock_file.exists() and service_pid_status(pid_file, ("php-fpm",))[0], 5.0)
+    if not ok:
+        raise XamppError("php-fpm started but socket did not become ready within 5s.", 1)
+    _, pid = service_pid_status(pid_file, ("php-fpm",))
+    print(f"Started php-fpm (PID {pid}).")
+
+
+def start_apache(stack: dict[str, Any], rendered: dict[str, Path]) -> None:
+    pid_file = RUN_DIR / "httpd.pid"
+    existing = cleanup_stale_pid_and_socket(pid_file, None, ("httpd",))
+    port = int(stack["http_port"])
+    if existing:
+        print(f"Apache already running on 127.0.0.1:{port} (PID {existing}).")
+        return
+    check_port_free(port, label="Apache")
+    if stack["db_engine"] in ("mysql", "mariadb"):
+        check_port_free(int(stack["pma_port"]), label="phpMyAdmin")
+
+    res = subprocess.run(
+        [stack["httpd_bin"], "-f", str(rendered["httpd_conf"]), "-k", "start"],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        raise XamppError(f"Failed to start Apache:\n{res.stderr or res.stdout}", 1)
+
+    ok = wait_for(lambda: tcp_open("127.0.0.1", port) and service_pid_status(pid_file, ("httpd",))[0], 5.0)
+    if not ok:
+        raise XamppError(f"Apache did not start listening on 127.0.0.1:{port} within 5s.", 1)
+    _, pid = service_pid_status(pid_file, ("httpd",))
+    print(f"Started Apache on http://127.0.0.1:{port} (PID {pid}).")
+
+
+def start_db(stack: dict[str, Any], rendered: dict[str, Path]) -> None:
+    engine = stack["db_engine"]
+    if engine == "sqlite":
+        print("Database mode is 'sqlite' (built into PHP 8.4.8; no daemon needed).")
+        return
+    if not is_engine_installed(stack, engine):
+        raise XamppError(
+            f"Database engine '{engine}' is NOT downloaded yet. Run 'xamppctl db install {engine}' first.",
+            2,
+        )
+
+    pid_file = RUN_DIR / "db.pid"
+    running_other = detect_running_db_engine(stack)
+    if running_other is not None:
+        if running_other == engine:
+            _, pid = service_pid_status(pid_file, ("mysqld", "mariadbd", "postgres"))
+            print(f"{engine} already running (PID {pid}).")
+            return
+        raise XamppError(
+            f"Database '{running_other}' is currently running. Stop it cleanly before starting '{engine}'.",
+            1,
+        )
+
+    sock_file = get_engine_socket(engine)
+    expected = ("mysqld",) if engine == "mysql" else ("mariadbd",) if engine == "mariadb" else ("postgres",)
+    cleanup_stale_pid_and_socket(pid_file, sock_file, expected)
+
+    port = get_engine_port(engine)
+    if port is not None:
+        check_port_free(port, label=engine)
+
+    datadir = ensure_datadir_initialized(stack, rendered, engine)
+    paths = db_binary_paths(stack, engine)
+
+    if engine in ("mysql", "mariadb"):
+        log_file = LOGS_DIR / f"{engine}-error.log"
+        rotate_log_if_needed(log_file)
+        if (RUN_DIR / "mysql.sock.lock").exists():
+            (RUN_DIR / "mysql.sock.lock").unlink(missing_ok=True)
+        with open(log_file, "a", encoding="utf-8") as logf:
+            proc = subprocess.Popen(
+                [str(paths["daemon"]), f"--defaults-file={rendered['db_conf']}"],
+                stdout=logf,
+                stderr=logf,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+
+        def ready() -> bool:
+            if proc.poll() is not None:
+                return False
+            if sock_file is None or not sock_file.exists():
+                return False
+            if port and not tcp_open("127.0.0.1", port):
+                return False
+            return service_pid_status(pid_file, expected)[0]
+
+        if not wait_for(ready, 15.0):
+            tail = log_file.read_text(encoding="utf-8", errors="replace").splitlines()[-20:] if log_file.exists() else []
+            raise XamppError(
+                f"{engine} failed to become ready within 15s.\n" + "\n".join(tail),
+                1,
+            )
+        _, pid = service_pid_status(pid_file, expected)
+        print(f"Started {engine} on 127.0.0.1:{port} (PID {pid}).")
+    elif engine == "postgresql":
+        log_file = LOGS_DIR / "postgresql.log"
+        rotate_log_if_needed(log_file)
+        postmaster_pid = datadir / "postmaster.pid"
+        if postmaster_pid.exists():
+            old_pid = read_pid(postmaster_pid)
+            if old_pid and not pid_alive(old_pid):
+                postmaster_pid.unlink(missing_ok=True)
+        opts = f"-k '{RUN_DIR}' -c config_file='{rendered['db_conf']}'"
+        res = subprocess.run(
+            [str(paths["pg_ctl"]), "-D", str(datadir), "-l", str(log_file), "-o", opts, "-t", "15", "start"],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode != 0:
+            raise XamppError(f"PostgreSQL start failed:\n{res.stderr or res.stdout}", 1)
+        pg_pid = read_pid(postmaster_pid)
+        if pg_pid:
+            pid_file.write_text(f"{pg_pid}\n", encoding="utf-8")
+        print(f"Started postgresql on 127.0.0.1:5432 (PID {pg_pid}).")
+
+
+def stop_apache(stack: dict[str, Any], rendered: dict[str, Path], force_kill: bool = False) -> None:
+    pid_file = RUN_DIR / "httpd.pid"
+    alive, pid = service_pid_status(pid_file, ("httpd",))
+    if not alive or pid is None:
+        pid_file.unlink(missing_ok=True)
+        return
+    if not force_kill:
+        subprocess.run(
+            [stack["httpd_bin"], "-f", str(rendered["httpd_conf"]), "-k", "graceful-stop"],
+            capture_output=True,
+            text=True,
+        )
+        if not wait_for(lambda: not pid_alive(pid), 5.0):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+            wait_for(lambda: not pid_alive(pid), 3.0)
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    pid_file.unlink(missing_ok=True)
+    print("Stopped Apache.")
+
+
+def stop_php_fpm(force_kill: bool = False) -> None:
+    pid_file = RUN_DIR / "php-fpm.pid"
+    sock_file = RUN_DIR / "php-fpm.sock"
+    alive, pid = service_pid_status(pid_file, ("php-fpm",))
+    if not alive or pid is None:
+        pid_file.unlink(missing_ok=True)
+        sock_file.unlink(missing_ok=True)
+        return
+    sig = signal.SIGKILL if force_kill else signal.SIGQUIT
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        pass
+    if not force_kill and not wait_for(lambda: not pid_alive(pid), 5.0):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        wait_for(lambda: not pid_alive(pid), 3.0)
+    pid_file.unlink(missing_ok=True)
+    sock_file.unlink(missing_ok=True)
+    print("Stopped php-fpm.")
+
+
+def detect_running_db_engine(stack: dict[str, Any]) -> str | None:
+    pid_file = RUN_DIR / "db.pid"
+    alive, pid = service_pid_status(pid_file, ("mysqld", "mariadbd", "postgres"))
+    if alive and pid is not None:
+        comm = Path(pid_comm(pid)).name.lower()
+        if "mariadbd" in comm:
+            return "mariadb"
+        if "mysqld" in comm:
+            return "mysql"
+        if "postgres" in comm:
+            return "postgresql"
+    return None
+
+
+def stop_db(stack: dict[str, Any], force_kill: bool = False) -> None:
+    pid_file = RUN_DIR / "db.pid"
+    running_engine = detect_running_db_engine(stack)
+    if running_engine is None:
+        pid_file.unlink(missing_ok=True)
+        return
+    _, pid = service_pid_status(pid_file, ("mysqld", "mariadbd", "postgres"))
+    if pid is None:
+        return
+    sock_file = get_engine_socket(running_engine)
+    paths = db_binary_paths(stack, running_engine)
+
+    if force_kill:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    elif running_engine in ("mysql", "mariadb"):
+        # Try clean admin shutdown first; fall back to clean SIGTERM (works even if root password is set)
+        used_admin = False
+        if paths["admin"].exists() and sock_file and sock_file.exists():
+            res = subprocess.run(
+                [str(paths["admin"]), f"--socket={sock_file}", "-u", "root", "shutdown"],
+                capture_output=True,
+                text=True,
+            )
+            used_admin = res.returncode == 0
+        if not used_admin:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        if not wait_for(lambda: not pid_alive(pid), 20.0):
+            raise XamppError(
+                f"{running_engine} (PID {pid}) did not finish clean shutdown within 20s; left running to prevent InnoDB corruption.",
+                1,
+            )
+    elif running_engine == "postgresql":
+        datadir = DATA_DIR / "postgresql"
+        if paths["pg_ctl"].exists() and datadir.exists():
+            subprocess.run(
+                [str(paths["pg_ctl"]), "-D", str(datadir), "-m", "fast", "-t", "20", "stop"],
+                capture_output=True,
+                text=True,
+            )
+        if pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        if not wait_for(lambda: not pid_alive(pid), 20.0):
+            raise XamppError(f"PostgreSQL (PID {pid}) did not exit cleanly within 20s.", 1)
+
+    pid_file.unlink(missing_ok=True)
+    if sock_file:
+        sock_file.unlink(missing_ok=True)
+    if (RUN_DIR / "mysql.sock.lock").exists():
+        (RUN_DIR / "mysql.sock.lock").unlink(missing_ok=True)
+    if (RUN_DIR / ".s.PGSQL.5432.lock").exists():
+        (RUN_DIR / ".s.PGSQL.5432.lock").unlink(missing_ok=True)
+    print(f"Stopped {running_engine} cleanly.")
+
+
+def normalize_targets(targets: list[str] | None) -> list[str]:
+    if not targets or "all" in targets:
+        return ["all"]
+    seen: list[str] = []
+    for t in targets:
+        if t not in seen:
+            seen.append(t)
+    return seen
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    with advisory_lock(True):
+        stack = load_stack()
+        targets = normalize_targets(args.targets)
+        need_all = targets == ["all"]
+        need_php = need_all or "php" in targets
+        need_httpd = need_all or "apache" in targets
+        need_db = need_all or "db" in targets
+
+        if need_db and not is_engine_installed(stack, stack["db_engine"]):
+            raise XamppError(
+                f"Active db_engine '{stack['db_engine']}' is NOT downloaded. Run 'xamppctl db install {stack['db_engine']}' or switch via 'xamppctl db use mysql'.",
+                2,
+            )
+        rendered = render_configs(stack)
+        validate_configs(stack, rendered, check_php=need_php, check_httpd=need_httpd, check_db=need_db)
+        if need_php:
+            start_php_fpm(stack, rendered)
+        if need_httpd:
+            start_apache(stack, rendered)
+        if need_db:
+            start_db(stack, rendered)
+    return 0
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    with advisory_lock(True):
+        stack = load_stack()
+        rendered = render_configs(stack)
+        targets = normalize_targets(args.targets)
+        need_all = targets == ["all"]
+        if need_all or "apache" in targets:
+            stop_apache(stack, rendered, args.kill)
+        if need_all or "php" in targets:
+            stop_php_fpm(args.kill)
+        if need_all or "db" in targets:
+            stop_db(stack, args.kill)
+    return 0
+
+
+def cmd_restart(args: argparse.Namespace) -> int:
+    cmd_stop(argparse.Namespace(targets=args.targets, kill=False))
+    cmd_start(argparse.Namespace(targets=args.targets))
+    return 0
+
+
+def child_pids(parent_pid: int | None) -> list[int]:
+    if parent_pid is None:
+        return []
+    res = subprocess.run(["pgrep", "-P", str(parent_pid)], capture_output=True, text=True)
+    pids = [parent_pid]
+    for line in res.stdout.splitlines():
+        try:
+            pids.append(int(line.strip()))
+        except ValueError:
+            pass
+    return pids
+
+
+def measure_footprints(pids: list[int]) -> dict[int, dict[str, Any]]:
+    if not pids:
+        return {}
+    cmd = ["/usr/bin/footprint", "--noCategories", "--swapped"]
+    for pid in pids:
+        cmd.extend(["--pid", str(pid)])
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    out: dict[int, dict[str, Any]] = {}
+    if res.returncode != 0:
+        return out
+    for line in res.stdout.splitlines():
+        m = re.search(r"\[(\d+)\].*?(\d+(?:\.\d+)?)\s*(KB|MB|GB|B)", line, re.IGNORECASE)
+        if m:
+            pid = int(m.group(1))
+            val = float(m.group(2))
+            unit = m.group(3).upper()
+            mb = val / 1024.0 if unit == "KB" else val * 1024.0 if unit == "GB" else val / (1024.0 * 1024.0) if unit == "B" else val
+            out[pid] = {"footprint_mb": round(mb, 2), "raw": line.strip()}
+    return out
+
+
+def engine_catalog_status(stack: dict[str, Any]) -> list[dict[str, Any]]:
+    active = stack["db_engine"]
+    specs = [
+        ("mysql", "MySQL 8.4 LTS", "default (tarball arm64)" if stack.get("mysql_source") == "tarball" else "mysql@8.4"),
+        ("mariadb", "MariaDB 13", stack.get("mariadb_formula", "mariadb")),
+        ("postgresql", "PostgreSQL 18", stack.get("postgresql_formula", "postgresql@18")),
+        ("sqlite", "SQLite 3 (PHP Built-in)", "php pdo_sqlite"),
+    ]
+    rows = []
+    for eid, name, src in specs:
+        installed = is_engine_installed(stack, eid)
+        if eid == active and installed:
+            state = "ACTIVE"
+        elif installed:
+            state = "INSTALLED"
+        else:
+            state = "NOT_DOWNLOADED"
+        rows.append(
+            {
+                "id": eid,
+                "name": name,
+                "source": src,
+                "installed": installed,
+                "active": eid == active,
+                "state": state,
+                "port": get_engine_port(eid),
+            }
+        )
+    return rows
+
+
+def collect_status(include_memory: bool = False) -> dict[str, Any]:
+    stack = load_stack()
+    apache_alive, apache_pid = service_pid_status(RUN_DIR / "httpd.pid", ("httpd",))
+    php_alive, php_pid = service_pid_status(RUN_DIR / "php-fpm.pid", ("php-fpm",))
+    db_alive, db_pid = service_pid_status(RUN_DIR / "db.pid", ("mysqld", "mariadbd", "postgres"))
+    running_db = detect_running_db_engine(stack) if db_alive else None
+
+    apache_tree = child_pids(apache_pid) if apache_alive else []
+    php_tree = child_pids(php_pid) if php_alive else []
+    db_tree = child_pids(db_pid) if db_alive else []
+
+    footprints = {}
+    if include_memory:
+        pids = apache_tree + php_tree + db_tree
+        footprints = measure_footprints(pids)
+
+    def tree_mb(tree: list[int]) -> float:
+        return round(sum(footprints.get(p, {}).get("footprint_mb", 0.0) for p in tree), 2)
+
+    return {
+        "project_root": str(PROJECT_ROOT),
+        "web_root": str(get_web_root(stack)),
+        "recent_web_roots": [str(expand(p)) for p in stack.get("recent_web_roots", ["~/Sites/Xampp"])],
+        "app_support": str(APP_SUPPORT),
+        "http_port": int(stack["http_port"]),
+        "pma_port": int(stack["pma_port"]),
+        "db_engine": stack["db_engine"],
+        "db_profile": stack["db_profile"],
+        "db_port": get_engine_port(stack["db_engine"]),
+        "phpmyadmin_available": stack["db_engine"] in ("mysql", "mariadb"),
+        "services": {
+            "apache": {
+                "status": "running" if apache_alive else "stopped",
+                "pid": apache_pid,
+                "port": int(stack["http_port"]),
+                "footprint_mb": tree_mb(apache_tree),
+            },
+            "php_fpm": {
+                "status": "running" if php_alive else "stopped",
+                "pid": php_pid,
+                "socket": str(RUN_DIR / "php-fpm.sock"),
+                "footprint_mb": tree_mb(php_tree),
+            },
+            "db": {
+                "status": "builtin" if stack["db_engine"] == "sqlite" else ("running" if db_alive else "stopped"),
+                "engine": running_db or stack["db_engine"],
+                "pid": db_pid,
+                "port": get_engine_port(running_db or stack["db_engine"]),
+                "socket": str(get_engine_socket(running_db or stack["db_engine"]) or ""),
+                "footprint_mb": tree_mb(db_tree),
+            },
+        },
+        "engines": engine_catalog_status(stack),
+    }
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    with advisory_lock(False):
+        st = collect_status(include_memory=args.memory)
+    if args.json:
+        print(json.dumps(st, indent=2))
+        return 0
+    print(f"HTTP Port  : 127.0.0.1:{st['http_port']}")
+    print(f"DB Engine  : {st['db_engine']} (profile: {st['db_profile']})")
+    for key in ("apache", "php_fpm", "db"):
+        svc = st["services"][key]
+        mem = f" | footprint={svc['footprint_mb']} MB" if args.memory and svc["status"] == "running" else ""
+        pid_str = f"PID {svc['pid']}" if svc["pid"] else "-"
+        print(f"  {key:<8}: {svc['status']:<8} ({pid_str}){mem}")
+    return 0
+
+
+def cmd_db_list(args: argparse.Namespace) -> int:
+    stack = load_stack()
+    rows = engine_catalog_status(stack)
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    for r in rows:
+        port_s = str(r["port"]) if r["port"] else "file"
+        print(f"  {r['id']:<12} {r['state']:<16} port={port_s:<6} source={r['source']}")
+    return 0
+
+
+def brew_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
+    env["HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK"] = "1"
+    return env
+
+
+def ensure_php_pinned(stack: dict[str, Any]) -> None:
+    subprocess.run(["brew", "pin", stack["php_formula"]], env=brew_env(), capture_output=True, text=True)
+
+
+def cmd_db_install(args: argparse.Namespace) -> int:
+    with advisory_lock(True):
+        stack = load_stack()
+        engine = args.engine
+        if engine == "sqlite":
+            print("SQLite 3 is already built into PHP 8.4.8 (no download required).")
+            return 0
+        if engine == "mysql" and stack.get("mysql_source") == "tarball":
+            if is_engine_installed(stack, "mysql"):
+                print("MySQL 8.4 LTS (arm64 tarball) is already installed.")
+                return 0
+            raise XamppError("MySQL 8.4 tarball missing; reinstall tarball or switch mysql_source.", 1)
+
+        formula = {
+            "mysql": "mysql@8.4",
+            "mariadb": stack.get("mariadb_formula", "mariadb"),
+            "postgresql": stack.get("postgresql_formula", "postgresql@18"),
+        }[engine]
+
+        if is_engine_installed(stack, engine):
+            print(f"{engine} ({formula}) is already installed.")
+            if args.use:
+                return _switch_db_engine(stack, engine)
+            return 0
+
+        ensure_php_pinned(stack)
+        dry = subprocess.run(["brew", "install", "--dry-run", formula], env=brew_env(), capture_output=True, text=True)
+        output = (dry.stdout or "") + (dry.stderr or "")
+        print(output.strip())
+        if dry.returncode != 0:
+            raise XamppError(f"Homebrew dry-run failed for {formula}.", 1)
+
+        if args.dry_run:
+            return 0
+
+        would_upgrade = "Would upgrade" in output
+        if would_upgrade and not args.allow_brew_dep_upgrades:
+            if not args.yes or not sys.stdin.isatty():
+                raise XamppError(
+                    f"Blocked: installing '{formula}' via Homebrew would upgrade shared dependencies listed above.\n"
+                    f"Re-run with '--allow-brew-dep-upgrades' if you explicitly approve those updates.",
+                    2,
+                )
+            ans = input("Approve these Homebrew dependency updates and proceed? [y/N]: ").strip().lower()
+            if ans not in ("y", "yes"):
+                print("Cancelled; nothing on your Mac was changed.")
+                return 1
+
+        res = subprocess.run(["brew", "install", formula], env=brew_env())
+        if res.returncode != 0:
+            raise XamppError(f"brew install {formula} failed.", 1)
+        subprocess.run(["brew", "pin", formula], env=brew_env(), capture_output=True)
+
+        daemon = db_binary_paths(stack, engine)["daemon"]
+        if not check_file_arm64(daemon):
+            raise XamppError(f"Installed binary {daemon} did not verify as arm64!", 1)
+        print(f"Installed and pinned {engine} ({formula}) [arm64 verified].")
+
+        if args.use:
+            return _switch_db_engine(stack, engine)
+    return 0
+
+
+def cmd_db_uninstall(args: argparse.Namespace) -> int:
+    with advisory_lock(True):
+        stack = load_stack()
+        engine = args.engine
+        if engine in ("mysql", "sqlite"):
+            raise XamppError(f"Cannot uninstall default/built-in engine '{engine}'.", 1)
+        if stack["db_engine"] == engine:
+            raise XamppError(f"'{engine}' is currently selected. Switch away first (e.g. 'xamppctl db use mysql').", 1)
+        formula = stack.get("mariadb_formula", "mariadb") if engine == "mariadb" else stack.get("postgresql_formula", "postgresql@18")
+        subprocess.run(["brew", "unpin", formula], env=brew_env(), capture_output=True)
+        res = subprocess.run(["brew", "uninstall", formula], env=brew_env())
+        if res.returncode != 0:
+            raise XamppError(f"brew uninstall {formula} failed.", 1)
+        if args.purge_data and (DATA_DIR / engine).exists():
+            shutil.rmtree(DATA_DIR / engine)
+        print(f"Removed {engine} ({formula}).")
+    return 0
+
+
+def _switch_db_engine(stack: dict[str, Any], engine: str) -> int:
+    if not is_engine_installed(stack, engine):
+        raise XamppError(
+            f"Engine '{engine}' is NOT downloaded yet and cannot be selected.\n"
+            f"Download it first with: xamppctl db install {engine} --use",
+            2,
+        )
+    if detect_running_db_engine(stack) is not None:
+        stop_db(stack, force_kill=False)
+    stack["db_engine"] = engine
+    save_stack(stack)
+    rendered = render_configs(stack)
+    # Keep Apache's phpMyAdmin alias state synchronized if Apache is running
+    apache_alive, _ = service_pid_status(RUN_DIR / "httpd.pid", ("httpd",))
+    if apache_alive:
+        subprocess.run([stack["httpd_bin"], "-f", str(rendered["httpd_conf"]), "-k", "graceful"], capture_output=True)
+    print(f"Active database engine set to '{engine}'.")
+    return 0
+
+
+def cmd_db_use(args: argparse.Namespace) -> int:
+    with advisory_lock(True):
+        stack = load_stack()
+        return _switch_db_engine(stack, args.engine)
+
+
+def cmd_db_profile(args: argparse.Namespace) -> int:
+    with advisory_lock(True):
+        stack = load_stack()
+        stack["db_profile"] = args.profile
+        save_stack(stack)
+        render_configs(stack)
+        print(f"Database memory profile set to '{args.profile}'. Restart DB to apply if currently running.")
+    return 0
+
+
+def validate_db_name(name: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_$-]{0,63}", name):
+        raise XamppError(
+            f"Invalid database name '{name}': must start with letter/digit/'_' and contain only letters, digits, '_', '-', '$' (max 64 chars).",
+            1,
+        )
+    return name
+
+
+def validate_vhost_domain(domain: str) -> str:
+    low = domain.lower()
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", low):
+        raise XamppError(f"Invalid virtual host domain '{domain}'. Use a hostname like 'myapp.test'.", 1)
+    if not low.endswith(".test"):
+        raise XamppError(f"Virtual host domain '{domain}' must end with '.test' (DNS rebinding protection).", 1)
+    return low
+
+
+def validate_docroot(docroot: Path) -> Path:
+    s = str(docroot)
+    if any(ch in s for ch in ('\n', '\r', '"', "'", "\x00")):
+        raise XamppError("DocumentRoot contains unsafe characters.", 1)
+    exact_forbidden = [Path("/"), Path.home().resolve(), WEB_ROOT.parent.resolve()]
+    if docroot in exact_forbidden:
+        raise XamppError(f"Refused DocumentRoot on top-level directory: {docroot}", 1)
+    forbidden_trees = [
+        Path("/etc"),
+        Path("/System"),
+        Path("/usr"),
+        Path("/Library"),
+        Path("/private/var"),
+        Path.home() / "Library",
+        Path.home() / ".ssh",
+        APP_SUPPORT,
+        PROJECT_ROOT,
+    ]
+    for fb in forbidden_trees:
+        fb_res = fb.resolve()
+        if docroot == fb_res or fb_res in docroot.parents:
+            raise XamppError(f"Refused DocumentRoot inside protected directory: {fb_res}", 1)
+    return docroot
+
+
+def cmd_db_import(args: argparse.Namespace) -> int:
+    with advisory_lock(True):
+        stack = load_stack()
+        engine = stack["db_engine"]
+        sql_path = Path(args.file).expanduser().resolve()
+        if not sql_path.is_file():
+            raise XamppError(f"SQL file not found: {sql_path}", 1)
+        if engine == "sqlite":
+            raise XamppError("db import is for server databases (mysql/mariadb/postgresql).", 1)
+        if detect_running_db_engine(stack) != engine:
+            raise XamppError(f"Start '{engine}' before importing ('xamppctl start db').", 1)
+        target_db = validate_db_name(args.database) if args.database else None
+
+        has_0900 = False
+        if engine == "mariadb":
+            pat_0900 = re.compile(r"utf8mb4_0900_(ai|as)_(ci|cs)", re.IGNORECASE)
+            with open(sql_path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if pat_0900.search(line):
+                        has_0900 = True
+                        break
+            if has_0900 and not args.convert_collation:
+                raise XamppError(
+                    "Collation mismatch detected: SQL dump uses MySQL 8.x 'utf8mb4_0900_*' collations which do NOT exist in MariaDB.\n"
+                    "Recommended: switch to MySQL ('xamppctl db use mysql'), OR re-run with '--convert-collation' to stream as utf8mb4_unicode_ci/cs.",
+                    1,
+                )
+
+        paths = db_binary_paths(stack, engine)
+        sock = get_engine_socket(engine)
+        if engine in ("mysql", "mariadb"):
+            cmd = [str(paths["client"]), f"--socket={sock}", "-u", "root"]
+            if target_db:
+                subprocess.run(cmd + ["-e", f"CREATE DATABASE IF NOT EXISTS `{target_db}`;"], check=True)
+                cmd.append(target_db)
+            if engine == "mariadb" and has_0900 and args.convert_collation:
+                print("Warning: streaming utf8mb4_0900_* -> utf8mb4_unicode_* translation (original file untouched).")
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                assert proc.stdin is not None
+                pat_ai = re.compile(r"utf8mb4_0900_(?:ai|as)_ci", re.IGNORECASE)
+                pat_as = re.compile(r"utf8mb4_0900_as_cs", re.IGNORECASE)
+                with open(sql_path, "r", encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        if "0900" in line:
+                            line = pat_ai.sub("utf8mb4_unicode_ci", line)
+                            line = pat_as.sub("utf8mb4_unicode_cs", line)
+                        proc.stdin.write(line)
+                proc.stdin.close()
+                _, err = proc.communicate()
+                if proc.returncode != 0:
+                    raise XamppError(f"SQL import failed:\n{err}", 1)
+            else:
+                with open(sql_path, "rb") as fh:
+                    res = subprocess.run(cmd, stdin=fh, capture_output=True)
+                if res.returncode != 0:
+                    raise XamppError(f"SQL import failed:\n{res.stderr.decode('utf-8', errors='replace')}", 1)
+        elif engine == "postgresql":
+            cmd = [str(paths["client"]), "-h", "127.0.0.1", "-p", "5432", "-U", "postgres"]
+            if target_db:
+                cmd.extend(["-d", target_db])
+            res = subprocess.run(cmd + ["-f", str(sql_path)], text=True, capture_output=True)
+            if res.returncode != 0:
+                raise XamppError(f"PostgreSQL import failed:\n{res.stderr}", 1)
+        print(f"Imported {sql_path.name} into {engine}.")
+    return 0
+
+
+def cmd_vhost(args: argparse.Namespace) -> int:
+    with advisory_lock(True):
+        stack = load_stack()
+        vhosts_dir = VHOSTS_DIR.resolve()
+        vhosts_dir.mkdir(parents=True, exist_ok=True)
+        if args.action == "list":
+            for f in sorted(vhosts_dir.glob("*.conf")):
+                print(f.stem)
+            return 0
+        if args.action == "add":
+            domain = validate_vhost_domain(args.domain)
+            docroot = validate_docroot(
+                Path(args.docroot).expanduser().resolve() if args.docroot else (WEB_ROOT / "sites" / domain.split(".")[0]).resolve()
+            )
+            docroot.mkdir(parents=True, exist_ok=True)
+            conf_file = (vhosts_dir / f"{domain}.conf").resolve()
+            if conf_file.parent != vhosts_dir:
+                raise XamppError("Invalid vhost destination path.", 1)
+            conf_file.write_text(
+                f"<VirtualHost 127.0.0.1:{stack['http_port']}>\n"
+                f"    ServerName {domain}\n"
+                f"    DocumentRoot \"{docroot}\"\n"
+                f"    <Directory \"{docroot}\">\n"
+                f"        Options Indexes SymLinksIfOwnerMatch\n"
+                f"        AllowOverride All\n"
+                f"        Require local\n"
+                f"    </Directory>\n"
+                f"</VirtualHost>\n",
+                encoding="utf-8",
+            )
+            rendered = render_configs(stack)
+            validate_configs(stack, rendered, False, True, False)
+            if service_pid_status(RUN_DIR / "httpd.pid", ("httpd",))[0]:
+                subprocess.run([stack["httpd_bin"], "-f", str(rendered["httpd_conf"]), "-k", "graceful"], check=True)
+            print(f"Added vhost http://{domain}:{stack['http_port']} -> {docroot}")
+            return 0
+        if args.action == "remove":
+            domain = validate_vhost_domain(args.domain)
+            conf_file = (vhosts_dir / f"{domain}.conf").resolve()
+            if conf_file.parent != vhosts_dir:
+                raise XamppError("Invalid vhost destination path.", 1)
+            conf_file.unlink(missing_ok=True)
+            rendered = render_configs(stack)
+            if service_pid_status(RUN_DIR / "httpd.pid", ("httpd",))[0]:
+                subprocess.run([stack["httpd_bin"], "-f", str(rendered["httpd_conf"]), "-k", "graceful"], check=True)
+            print(f"Removed vhost {domain}")
+            return 0
+        if args.action == "dns":
+            print("Optional .test DNS resolution guide:")
+            print("  1. Check upgrades first: brew install --dry-run dnsmasq")
+            print("  2. Install & configure:  sudo mkdir -p /etc/resolver && echo 'nameserver 127.0.0.1' | sudo tee /etc/resolver/test")
+            print(f"  3. Copy config:          {CONFIG_DIR / 'dnsmasq' / 'xampp-test.conf'} -> /opt/homebrew/etc/dnsmasq.d/")
+            print("  Or map individual hosts cleanly in /etc/hosts without dnsmasq.")
+    return 0
+
+
+def cmd_webroot(args: argparse.Namespace) -> int:
+    with advisory_lock(True):
+        stack = load_stack()
+        if args.list:
+            print(f"Active : {get_web_root(stack)}")
+            for p in stack.get("recent_web_roots", []):
+                print(f"Recent : {expand(p)}")
+            return 0
+
+        if args.reset:
+            target_path = WEB_ROOT.resolve()
+            target_path.mkdir(parents=True, exist_ok=True)
+        elif args.path:
+            target_path = Path(args.path).expanduser().resolve()
+        else:
+            print(get_web_root(stack))
+            return 0
+
+        if not target_path.exists() or not target_path.is_dir():
+            raise XamppError(f"Directory does not exist: {target_path}", 1)
+        validate_docroot(target_path)
+
+        tcc_dirs = [Path.home() / "Desktop", Path.home() / "Documents", Path.home() / "Downloads"]
+        if any(target_path == d.resolve() or d.resolve() in target_path.parents for d in tcc_dirs):
+            print(
+                "Note: macOS protects Desktop/Documents/Downloads via TCC when using /usr/sbin/httpd; "
+                "if you see HTTP 403, move/symlink projects under ~/Sites or ~/Projects (or set Homebrew httpd_bin).",
+                file=sys.stderr,
+            )
+
+        recents = [str(expand(p)) for p in stack.get("recent_web_roots", [])]
+        target_str = str(target_path)
+        recents = [target_str] + [r for r in recents if r != target_str]
+        stack["web_root"] = target_str
+        stack["recent_web_roots"] = recents[:8]
+        save_stack(stack)
+
+        rendered = render_configs(stack)
+        validate_configs(stack, rendered, False, True, False)
+        if service_pid_status(RUN_DIR / "httpd.pid", ("httpd",))[0]:
+            subprocess.run([stack["httpd_bin"], "-f", str(rendered["httpd_conf"]), "-k", "graceful"], check=True)
+        print(f"Website DocumentRoot switched to: {target_str}")
+    return 0
+
+
+def cmd_port80(args: argparse.Namespace) -> int:
+    stack = load_stack()
+    anchor = "/etc/pf.anchors/com.xampplocal"
+    if args.action == "status":
+        res = subprocess.run(["pfctl", "-a", "com.xampplocal", "-s", "nat"], capture_output=True, text=True)
+        print(res.stdout.strip() or "Port 80 redirect: inactive")
+        return 0
+    if args.action == "enable":
+        rule = f"rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port 80 -> 127.0.0.1 port {stack['http_port']}"
+        print("Run with sudo to enable local port 80 -> 8080 redirect (non-persistent across reboot):")
+        print(f"  echo '{rule}' | sudo tee {anchor}")
+        print(f"  sudo pfctl -a com.xampplocal -f {anchor} && sudo pfctl -e")
+    elif args.action == "disable":
+        print("Run with sudo to disable local port 80 redirect:")
+        print(f"  sudo pfctl -a com.xampplocal -F all && sudo rm -f {anchor}")
+    return 0
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    stack = load_stack()
+    mapping = {
+        "apache": [LOGS_DIR / "apache-error.log", LOGS_DIR / "apache-access.log"],
+        "php": [LOGS_DIR / "php-fpm.log", LOGS_DIR / "php-error.log"],
+        "db": [LOGS_DIR / f"{stack['db_engine']}-error.log" if stack["db_engine"] in ("mysql", "mariadb") else LOGS_DIR / "postgresql.log"],
+    }
+    files = mapping["apache"] + mapping["php"] + mapping["db"] if args.service == "all" else mapping[args.service]
+    existing = [str(f) for f in files if f.exists()]
+    if not existing:
+        print("No log files created yet.")
+        return 0
+    cmd = ["tail", "-n", str(args.lines)] + (["-f"] if args.follow else []) + existing
+    return subprocess.run(cmd).returncode
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    with advisory_lock(False):
+        stack = load_stack()
+        ensure_dirs()
+    failures = 0
+
+    def report(ok: bool, label: str, detail: str) -> None:
+        nonlocal failures
+        mark = "OK  " if ok else "FAIL"
+        if not ok:
+            failures += 1
+        print(f"[{mark}] {label:<28} {detail}")
+
+    # 1. Socket path byte checks
+    for name, sock in [("mysql.sock", RUN_DIR / "mysql.sock"), ("mysql.sock.lock", RUN_DIR / "mysql.sock.lock"), ("pg.sock", RUN_DIR / ".s.PGSQL.5432")]:
+        b = len(str(sock).encode("utf-8"))
+        report(b <= MAX_UNIX_SOCKET_BYTES, f"Socket path ({name})", f"{b} bytes (limit {MAX_UNIX_SOCKET_BYTES})")
+
+    # 2. Disk free
+    free_gib = shutil.disk_usage(APP_SUPPORT).free / (1024 ** 3)
+    report(free_gib >= 2.0, "Free disk space", f"{free_gib:.1f} GiB available")
+
+    # 3. iCloud Desktop sync check
+    ic = subprocess.run(["defaults", "read", "com.apple.finder", "FXICloudDriveDesktop"], capture_output=True, text=True)
+    ic_val = ic.stdout.strip() or "unset/0"
+    report(True, "Mutable data isolation", f"Data in Application Support (FXICloudDriveDesktop={ic_val})")
+
+    # 4. Binary architectures
+    httpd_ok = check_file_arm64(Path(stack["httpd_bin"]))
+    report(httpd_ok, "Apache binary (arm64)", stack["httpd_bin"])
+    php_bin = php_paths(stack)["php"]
+    fpm_bin = php_paths(stack)["php_fpm"]
+    report(check_file_arm64(php_bin) and check_file_arm64(fpm_bin), "PHP 8.4 binary (arm64)", str(php_bin))
+
+    # 5. Brew version preservation & php pin
+    pinned = subprocess.run(["brew", "list", "--pinned"], capture_output=True, text=True).stdout.split()
+    report(stack["php_formula"] in pinned, "PHP pin lock", f"pinned={pinned}")
+    if BASELINE_BREW_FILE.exists():
+        cur_brew = subprocess.run(["brew", "list", "--versions"], env=brew_env(), capture_output=True, text=True).stdout
+        base_lines = set(BASELINE_BREW_FILE.read_text(encoding="utf-8").splitlines())
+        cur_lines = set(cur_brew.splitlines())
+        changed = [l for l in (base_lines ^ cur_lines) if l and not l.startswith("Error:")]
+        report(len(changed) == 0, "Zero Mac pkg drift", "matches baseline" if not changed else f"diff: {changed[:3]}")
+
+    # 6. Active DB readiness & config syntax
+    eng = stack["db_engine"]
+    db_inst = is_engine_installed(stack, eng)
+    report(db_inst, f"Active DB ({eng})", "installed & ready" if db_inst else "NOT DOWNLOADED")
+    if db_inst and eng != "sqlite":
+        daemon = db_binary_paths(stack, eng)["daemon"]
+        report(check_file_arm64(daemon), f"{eng} binary (arm64)", str(daemon))
+
+    try:
+        rendered = render_configs(stack)
+        validate_configs(stack, rendered, check_php=True, check_httpd=True, check_db=db_inst)
+        report(True, "Config syntax checks", "httpd -t, php-fpm -t, DB config OK")
+    except XamppError as exc:
+        report(False, "Config syntax checks", str(exc).splitlines()[0])
+
+    # 7. Mode 0700 checks
+    mode_ok = (os.stat(DATA_DIR).st_mode & 0o777) == 0o700 and (os.stat(RUN_DIR).st_mode & 0o777) == 0o700
+    report(mode_ok, "Directory permissions", "data/ and run/ are 0700")
+
+    return 1 if failures else 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="xamppctl", description="Native arm64 macOS XAMPP Stack Controller")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("start")
+    sp.add_argument("targets", nargs="*", default=["all"], choices=["all", "apache", "php", "db"])
+    sp.set_defaults(func=cmd_start)
+
+    sp = sub.add_parser("stop")
+    sp.add_argument("targets", nargs="*", default=["all"], choices=["all", "apache", "php", "db"])
+    sp.add_argument("--kill", action="store_true", help="Force SIGKILL (emergency only)")
+    sp.set_defaults(func=cmd_stop)
+
+    sp = sub.add_parser("restart")
+    sp.add_argument("targets", nargs="*", default=["all"], choices=["all", "apache", "php", "db"])
+    sp.set_defaults(func=cmd_restart)
+
+    sp = sub.add_parser("status")
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--memory", action="store_true")
+    sp.set_defaults(func=cmd_status)
+
+    dbp = sub.add_parser("db")
+    dbsub = dbp.add_subparsers(dest="db_cmd", required=True)
+
+    sp = dbsub.add_parser("list")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_db_list)
+
+    sp = dbsub.add_parser("install")
+    sp.add_argument("engine", choices=["mysql", "mariadb", "postgresql", "sqlite"])
+    sp.add_argument("--dry-run", action="store_true")
+    sp.add_argument("--allow-brew-dep-upgrades", action="store_true")
+    sp.add_argument("--yes", action="store_true")
+    sp.add_argument("--use", action="store_true")
+    sp.set_defaults(func=cmd_db_install)
+
+    sp = dbsub.add_parser("uninstall")
+    sp.add_argument("engine", choices=["mysql", "mariadb", "postgresql", "sqlite"])
+    sp.add_argument("--purge-data", action="store_true")
+    sp.set_defaults(func=cmd_db_uninstall)
+
+    sp = dbsub.add_parser("use")
+    sp.add_argument("engine", choices=["mysql", "mariadb", "postgresql", "sqlite"])
+    sp.set_defaults(func=cmd_db_use)
+
+    sp = dbsub.add_parser("profile")
+    sp.add_argument("profile", choices=["default", "eco", "import"])
+    sp.set_defaults(func=cmd_db_profile)
+
+    sp = dbsub.add_parser("import")
+    sp.add_argument("file")
+    sp.add_argument("database", nargs="?")
+    sp.add_argument("--convert-collation", action="store_true")
+    sp.set_defaults(func=cmd_db_import)
+
+    vp = sub.add_parser("vhost")
+    vsub = vp.add_subparsers(dest="action", required=True)
+    vsub.add_parser("list").set_defaults(func=cmd_vhost)
+    va = vsub.add_parser("add")
+    va.add_argument("domain")
+    va.add_argument("docroot", nargs="?")
+    va.set_defaults(func=cmd_vhost)
+    vr = vsub.add_parser("remove")
+    vr.add_argument("domain")
+    vr.set_defaults(func=cmd_vhost)
+    vsub.add_parser("dns").set_defaults(func=cmd_vhost)
+
+    wr = sub.add_parser("webroot")
+    wr.add_argument("path", nargs="?", help="Directory anywhere on disk to serve at 127.0.0.1:8080")
+    wr.add_argument("--list", action="store_true")
+    wr.add_argument("--reset", action="store_true", help="Reset to default ~/Sites/Xampp")
+    wr.set_defaults(func=cmd_webroot)
+
+    p80 = sub.add_parser("port80")
+    p80.add_argument("action", choices=["enable", "disable", "status"])
+    p80.set_defaults(func=cmd_port80)
+
+    lp = sub.add_parser("logs")
+    lp.add_argument("service", nargs="?", default="all", choices=["all", "apache", "php", "db"])
+    lp.add_argument("-f", "--follow", action="store_true")
+    lp.add_argument("--lines", type=int, default=40)
+    lp.set_defaults(func=cmd_logs)
+
+    dp = sub.add_parser("doctor")
+    dp.set_defaults(func=cmd_doctor)
+
+    return p
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        return args.func(args)
+    except XamppError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return exc.code
+    except subprocess.CalledProcessError as exc:
+        print(f"Command failed ({exc.returncode}): {exc.cmd}", file=sys.stderr)
+        return exc.returncode or 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

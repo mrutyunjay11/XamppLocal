@@ -1,0 +1,36 @@
+[mysqld]
+datadir = {{APP_SUPPORT}}/data/mysql
+pid-file = {{APP_SUPPORT}}/run/db.pid
+socket = {{APP_SUPPORT}}/run/mysql.sock
+log-error = {{APP_SUPPORT}}/logs/mysql-error.log
+
+bind-address = 127.0.0.1
+port = 3306
+mysqlx = OFF
+skip-name-resolve = ON
+local-infile = OFF
+performance_schema = OFF
+
+innodb_buffer_pool_size = {{INNODB_BUFFER_POOL_SIZE}}
+innodb_buffer_pool_instances = 1
+innodb_redo_log_capacity = 32M
+innodb_log_buffer_size = 4M
+innodb_flush_method = fsync
+innodb_flush_log_at_trx_commit = {{INNODB_FLUSH_TRX}}
+innodb_file_per_table = ON
+
+max_connections = {{MAX_CONNECTIONS}}
+table_open_cache = {{TABLE_OPEN_CACHE}}
+table_definition_cache = 256
+thread_cache_size = 4
+tmp_table_size = 16M
+max_heap_table_size = 16M
+max_allowed_packet = {{MAX_ALLOWED_PACKET}}
+
+character-set-server = utf8mb4
+collation-server = utf8mb4_0900_ai_ci
+
+[client]
+socket = {{APP_SUPPORT}}/run/mysql.sock
+default-character-set = utf8mb4
+

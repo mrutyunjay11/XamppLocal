@@ -1,0 +1,20 @@
+<?php
+declare(strict_types=1);
+
+$secretFile = '{{APP_SUPPORT}}/tmp/phpmyadmin/blowfish.secret';
+$cfg['blowfish_secret'] = is_readable($secretFile) ? trim((string) file_get_contents($secretFile)) : '';
+
+$i = 1;
+$cfg['Servers'][$i]['auth_type'] = 'cookie';
+$cfg['Servers'][$i]['host'] = 'localhost';
+$cfg['Servers'][$i]['socket'] = '{{APP_SUPPORT}}/run/mysql.sock';
+$cfg['Servers'][$i]['connect_type'] = 'socket';
+$cfg['Servers'][$i]['compress'] = false;
+// Safe ONLY while Apache (127.0.0.1:8080, Require local) and DB (127.0.0.1 / 0700 socket) are localhost-only
+$cfg['Servers'][$i]['AllowNoPassword'] = true;
+
+$cfg['AllowArbitraryServer'] = false;
+$cfg['TempDir'] = '{{APP_SUPPORT}}/tmp/phpmyadmin';
+$cfg['UploadDir'] = '';
+$cfg['SaveDir'] = '';
+

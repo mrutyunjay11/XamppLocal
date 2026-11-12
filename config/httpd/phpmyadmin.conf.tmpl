@@ -1,0 +1,22 @@
+# Isolated Browser Origin for phpMyAdmin (separate port from project web root)
+Listen 127.0.0.1:{{PMA_PORT}}
+
+<VirtualHost 127.0.0.1:{{PMA_PORT}}>
+    ServerName localhost
+    DocumentRoot "{{APP_SUPPORT}}/apps/phpmyadmin"
+    DirectoryIndex index.php
+
+    <Directory "{{APP_SUPPORT}}/apps/phpmyadmin">
+        Options -Indexes +SymLinksIfOwnerMatch
+        AllowOverride None
+        Require local
+        DirectoryIndex index.php
+        <FilesMatch "(?i)^config\.inc\.php$">
+            Require all denied
+        </FilesMatch>
+    </Directory>
+
+    <DirectoryMatch "(?i){{APP_SUPPORT}}/apps/phpmyadmin/(templates|libraries|setup)(/|$)">
+        Require all denied
+    </DirectoryMatch>
+</VirtualHost>

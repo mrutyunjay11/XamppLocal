@@ -1,0 +1,97 @@
+ServerRoot "{{HTTPD_ROOT}}"
+DefaultRuntimeDir "{{APP_SUPPORT}}/run"
+Mutex "default:{{APP_SUPPORT}}/run"
+Listen 127.0.0.1:{{HTTP_PORT}}
+
+PidFile "{{APP_SUPPORT}}/run/httpd.pid"
+ServerName localhost:{{HTTP_PORT}}
+ServerAdmin webmaster@localhost
+UseCanonicalName Off
+Timeout 600
+ProxyTimeout 600
+KeepAlive On
+MaxKeepAliveRequests 100
+KeepAliveTimeout 5
+
+LoadModule mpm_event_module {{HTTPD_MODULES_DIR}}/mod_mpm_event.so
+LoadModule authn_core_module {{HTTPD_MODULES_DIR}}/mod_authn_core.so
+LoadModule authz_core_module {{HTTPD_MODULES_DIR}}/mod_authz_core.so
+LoadModule authz_host_module {{HTTPD_MODULES_DIR}}/mod_authz_host.so
+LoadModule access_compat_module {{HTTPD_MODULES_DIR}}/mod_access_compat.so
+LoadModule dir_module {{HTTPD_MODULES_DIR}}/mod_dir.so
+LoadModule mime_module {{HTTPD_MODULES_DIR}}/mod_mime.so
+LoadModule alias_module {{HTTPD_MODULES_DIR}}/mod_alias.so
+LoadModule rewrite_module {{HTTPD_MODULES_DIR}}/mod_rewrite.so
+LoadModule headers_module {{HTTPD_MODULES_DIR}}/mod_headers.so
+LoadModule env_module {{HTTPD_MODULES_DIR}}/mod_env.so
+LoadModule setenvif_module {{HTTPD_MODULES_DIR}}/mod_setenvif.so
+LoadModule unixd_module {{HTTPD_MODULES_DIR}}/mod_unixd.so
+LoadModule log_config_module {{HTTPD_MODULES_DIR}}/mod_log_config.so
+LoadModule proxy_module {{HTTPD_MODULES_DIR}}/mod_proxy.so
+LoadModule proxy_fcgi_module {{HTTPD_MODULES_DIR}}/mod_proxy_fcgi.so
+LoadModule filter_module {{HTTPD_MODULES_DIR}}/mod_filter.so
+LoadModule deflate_module {{HTTPD_MODULES_DIR}}/mod_deflate.so
+
+<IfModule mpm_event_module>
+    StartServers             1
+    ServerLimit              4
+    ThreadLimit             16
+    ThreadsPerChild          8
+    MinSpareThreads          4
+    MaxSpareThreads         16
+    MaxRequestWorkers       32
+    MaxConnectionsPerChild 1000
+    AsyncRequestWorkerFactor 2
+</IfModule>
+
+ServerTokens Prod
+ServerSignature Off
+TraceEnable Off
+
+# Block DNS rebinding attacks even inside folders with .htaccess RewriteEngine On
+<If "%{HTTP_HOST} !~ /^(localhost|127\.0\.0\.1|\[::1\]|[a-z0-9-]+(\.[a-z0-9-]+)*\.test)(:[0-9]+)?$/i">
+    Require all denied
+</If>
+
+# Case-insensitive protection for macOS APFS: block .env, .git, .ht*, .DS_Store, .sql, .sqlite, and editor swap/backups
+<FilesMatch "(?i)(^\.(env|git|ht|DS_Store)|(\.(sql|sqlite3?|bak|old|orig|save|swp|swo)|~)$)">
+    Require all denied
+</FilesMatch>
+<DirectoryMatch "(?i)/\.git(/|$)">
+    Require all denied
+</DirectoryMatch>
+
+<Directory />
+    AllowOverride none
+    Require all denied
+</Directory>
+
+TypesConfig {{MIME_TYPES_FILE}}
+AddType application/x-compress .Z
+AddType application/x-gzip .gz .tgz
+
+# Case-insensitive PHP handler for APFS so .PHP cannot dump raw source
+<FilesMatch "(?i)\.php$">
+    <If "-f %{REQUEST_FILENAME}">
+        SetHandler "proxy:unix:{{APP_SUPPORT}}/run/php-fpm.sock|fcgi://localhost/"
+    </If>
+</FilesMatch>
+
+ErrorLog "|{{ROTATELOGS_BIN}} -n 3 '{{APP_SUPPORT}}/logs/apache-error.log' 10M"
+LogLevel warn
+LogFormat "%h %l %u %t \"%r\" %>s %b" common
+CustomLog "|{{ROTATELOGS_BIN}} -n 3 '{{APP_SUPPORT}}/logs/apache-access.log' 10M" common
+
+<VirtualHost 127.0.0.1:{{HTTP_PORT}}>
+    ServerName localhost
+    DocumentRoot "{{WEB_ROOT}}"
+    <Directory "{{WEB_ROOT}}">
+        Options Indexes SymLinksIfOwnerMatch
+        AllowOverride All
+        Require local
+    </Directory>
+    DirectoryIndex index.php index.html
+</VirtualHost>
+
+Include "{{APP_SUPPORT}}/run/generated/phpmyadmin.conf"
+IncludeOptional "{{APP_SUPPORT}}/run/generated/vhosts.conf"

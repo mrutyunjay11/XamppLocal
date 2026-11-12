@@ -1,0 +1,11 @@
+.DS_Store
+app/XamppControl.app/
+app/Resources/AppIcon.iconset/
+app/Resources/AppIcon-1024.png
+dist/
+htdocs
+config/httpd/vhosts.d/*.conf
+*.swp
+*.swo
+*~
+

@@ -1,0 +1,18 @@
+[global]
+pid = {{APP_SUPPORT}}/run/php-fpm.pid
+error_log = {{APP_SUPPORT}}/logs/php-fpm.log
+log_level = warning
+daemonize = yes
+process_control_timeout = 10s
+
+[www]
+listen = {{APP_SUPPORT}}/run/php-fpm.sock
+listen.mode = 0600
+
+pm = ondemand
+pm.max_children = 8
+pm.process_idle_timeout = 10s
+pm.max_requests = 500
+request_terminate_timeout = 0
+catch_workers_output = yes
+

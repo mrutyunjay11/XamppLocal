@@ -1,0 +1,15 @@
+listen_addresses = '127.0.0.1'
+port = 5432
+unix_socket_directories = '{{APP_SUPPORT}}/run'
+unix_socket_permissions = 0700
+max_connections = {{MAX_CONNECTIONS}}
+
+shared_buffers = {{PG_SHARED_BUFFERS}}
+work_mem = 4MB
+maintenance_work_mem = 32MB
+synchronous_commit = {{PG_SYNC_COMMIT}}
+
+logging_collector = off
+log_timezone = '{{TIMEZONE}}'
+timezone = '{{TIMEZONE}}'
+
