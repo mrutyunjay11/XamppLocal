@@ -66,6 +66,15 @@ open app/XamppControl.app
 | `xamppctl logs [all\|apache\|php\|db] [-f]` | Tail service logs |
 | `xamppctl doctor` | Run 13 health, permission, arch, and package-drift checks |
 
+### GUI Keyboard Shortcuts (`XamppControl.app`)
+* `⌘S` — Start All / Stop All Services
+* `⌘L` — Switch Website Folder (`⇧⌘L` resets to `~/Sites/Xampp`)
+* `⌘O` / `⌘P` — Open Site (`:8080`) / Open phpMyAdmin (`:8081`)
+* `⌘R` — Refresh Status & Measure RAM (`footprint`)
+* `⌘D` — Run Doctor Checks
+* `⌘K` / `⌘W` — Open Control Window / Close Window (`Esc` also closes)
+* `⌘Q` / `⌥⌘Q` — Quit App (Keep Servers Running) / Stop All & Quit
+
 ---
 
 ## Architecture & Directory Layout

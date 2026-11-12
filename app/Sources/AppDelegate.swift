@@ -26,10 +26,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set { UserDefaults.standard.set(newValue, forKey: dockPrefKey) }
     }
 
+    private var mainMasterItem: NSMenuItem?
+    private var mainPmaItem: NSMenuItem?
+    private var mainStopQuitItem: NSMenuItem?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let logo = appLogoImage {
             NSApp.applicationIconImage = logo
         }
+        setupMainMenu()
         NSApp.setActivationPolicy(keepInDock ? .regular : .accessory)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.menu = menu
@@ -37,6 +42,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateMenuIcon(running: false)
         rebuildMenu()
         refreshStatus(includeMemory: false)
+    }
+
+    private func makeItem(_ title: String, action: Selector?, key: String, mods: NSEvent.ModifierFlags = [.command], target: AnyObject? = nil) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.keyEquivalentModifierMask = mods
+        item.target = target
+        return item
+    }
+
+    private func setupMainMenu() {
+        let bar = NSMenu()
+
+        // App menu
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(makeItem("About XamppControl", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), key: "", target: NSApp))
+        appMenu.addItem(.separator())
+        let stopQuit = makeItem("Stop All Servers & Quit", action: #selector(menuStopAndQuit), key: "q", mods: [.command, .option], target: self)
+        mainStopQuitItem = stopQuit
+        appMenu.addItem(stopQuit)
+        appMenu.addItem(makeItem("Quit XamppControl (Keep Servers Running)", action: #selector(NSApplication.terminate(_:)), key: "q", target: NSApp))
+        appMenuItem.submenu = appMenu
+        bar.addItem(appMenuItem)
+
+        // Stack menu
+        let stackMenuItem = NSMenuItem()
+        let stackMenu = NSMenu(title: "Stack")
+        let master = makeItem("Start All Services", action: #selector(menuToggleAll), key: "s", target: self)
+        mainMasterItem = master
+        stackMenu.addItem(master)
+        stackMenu.addItem(makeItem("Refresh & Measure RAM", action: #selector(menuMeasureRAM), key: "r", target: self))
+        stackMenu.addItem(.separator())
+        stackMenu.addItem(makeItem("Switch Website Folder...", action: #selector(browseAndSwitchWebRoot), key: "l", target: self))
+        stackMenu.addItem(makeItem("Reset Website Folder to Default", action: #selector(resetWebRoot), key: "l", mods: [.command, .shift], target: self))
+        stackMenu.addItem(.separator())
+        stackMenu.addItem(makeItem("Open Site in Browser", action: #selector(openLocalhost), key: "o", target: self))
+        let pma = makeItem("Open phpMyAdmin", action: #selector(openPhpMyAdmin), key: "p", target: self)
+        mainPmaItem = pma
+        stackMenu.addItem(pma)
+        stackMenu.addItem(makeItem("Run Doctor Checks", action: #selector(runDoctor), key: "d", target: self))
+        stackMenuItem.submenu = stackMenu
+        bar.addItem(stackMenuItem)
+
+        // Edit menu (enables Cmd+C/V/X/A in dialogs & alerts)
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(makeItem("Cut", action: #selector(NSText.cut(_:)), key: "x"))
+        editMenu.addItem(makeItem("Copy", action: #selector(NSText.copy(_:)), key: "c"))
+        editMenu.addItem(makeItem("Paste", action: #selector(NSText.paste(_:)), key: "v"))
+        editMenu.addItem(makeItem("Select All", action: #selector(NSText.selectAll(_:)), key: "a"))
+        editMenuItem.submenu = editMenu
+        bar.addItem(editMenuItem)
+
+        // Window menu
+        let winMenuItem = NSMenuItem()
+        let winMenu = NSMenu(title: "Window")
+        winMenu.addItem(makeItem("Open Control Window", action: #selector(openControlWindow), key: "k", target: self))
+        winMenu.addItem(makeItem("Close Window", action: #selector(NSWindow.performClose(_:)), key: "w"))
+        winMenu.addItem(makeItem("Minimize", action: #selector(NSWindow.performMiniaturize(_:)), key: "m"))
+        winMenuItem.submenu = winMenu
+        bar.addItem(winMenuItem)
+
+        NSApp.mainMenu = bar
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -128,6 +196,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let st = lastStatus
         let anyRunning = (st?.services.apache.isRunning ?? false) || (st?.services.phpFpm.isRunning ?? false) || (st?.services.db.isRunning ?? false)
 
+        mainMasterItem?.title = anyRunning ? "Stop All Services" : "Start All Services"
+        mainMasterItem?.isEnabled = !busy
+        mainPmaItem?.isEnabled = st?.phpmyadminAvailable ?? false
+        mainStopQuitItem?.isEnabled = anyRunning && !busy
+
         let header = NSMenuItem(
             title: anyRunning ? "XamppLocal: Running (127.0.0.1:\(st?.httpPort ?? 8080))" : "XamppLocal: Stopped (0 MB)",
             action: nil,
@@ -153,7 +226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 memItem.isEnabled = false
                 menu.addItem(memItem)
             }
-            let meas = NSMenuItem(title: "Measure RAM (footprint)...", action: #selector(menuMeasureRAM), keyEquivalent: "")
+            let meas = NSMenuItem(title: "Measure RAM (footprint)...", action: #selector(menuMeasureRAM), keyEquivalent: "r")
             meas.target = self
             menu.addItem(meas)
 
@@ -214,7 +287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
-        let winItem = NSMenuItem(title: "Open Control Window", action: #selector(openControlWindow), keyEquivalent: "w")
+        let winItem = NSMenuItem(title: "Open Control Window", action: #selector(openControlWindow), keyEquivalent: "k")
         winItem.target = self
         menu.addItem(winItem)
 
@@ -246,12 +319,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(docItem)
 
         menu.addItem(.separator())
-        let stopQuitItem = NSMenuItem(title: "Stop All Servers & Quit", action: #selector(menuStopAndQuit), keyEquivalent: "")
+        let stopQuitItem = NSMenuItem(title: "Stop All Servers & Quit", action: #selector(menuStopAndQuit), keyEquivalent: "q")
+        stopQuitItem.keyEquivalentModifierMask = [.command, .option]
         stopQuitItem.target = self
         stopQuitItem.isEnabled = anyRunning && !busy
         menu.addItem(stopQuitItem)
 
         let quitItem = NSMenuItem(title: "Quit XamppControl (Keep Servers Running)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quitItem.target = NSApp
         menu.addItem(quitItem)
     }
 

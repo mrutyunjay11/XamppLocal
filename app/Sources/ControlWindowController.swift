@@ -304,4 +304,8 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         appDelegate?.handleWindowClosed()
     }
+
+    override func cancelOperation(_ sender: Any?) {
+        window?.performClose(sender)
+    }
 }
