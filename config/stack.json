@@ -7,9 +7,9 @@
   "php_formula": "php",
   "http_port": 8080,
   "pma_port": 8081,
-  "web_root": "/Users/mrutyunjayjoshi/Sites/Xampp",
+  "web_root": "~/Sites/Xampp",
   "recent_web_roots": [
-    "/Users/mrutyunjayjoshi/Sites/Xampp"
+    "~/Sites/Xampp"
   ],
   "db_engine": "mysql",
   "db_profile": "default",

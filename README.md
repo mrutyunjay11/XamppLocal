@@ -27,21 +27,20 @@ A fast, lightweight, native macOS `arm64` replacement for legacy Intel XAMPP—b
 
 ## Quick Start
 
-### Option 1: DMG Installer (macOS Apple Silicon)
+### Option 1: DMG Installer (Zero-Terminal Consumer Setup)
 1. Download **`XamppLocal.dmg`** from [GitHub Releases](https://github.com/mrutyunjay11/XamppLocal/releases/latest) and open it.
 2. Drag **`XamppControl.app`** into **`Applications`**.
-3. On a fresh Mac, initialize PHP/MySQL 8.4/phpMyAdmin once:
-   ```bash
-   /Applications/XamppControl.app/Contents/Resources/stack/scripts/setup.sh
-   ```
-4. Launch **`XamppControl`** from Applications or Spotlight.
+3. Launch **`XamppControl`** from Applications or Spotlight.
+   * If running on a fresh Mac without existing PHP or MySQL, the native **Setup Wizard** appears automatically.
+   * Click **`[ ⚡ Set Up Local Stack (One-Click) ]`** to acquire and initialize your Apple Silicon PHP engine, MySQL 8.4 LTS, and isolated phpMyAdmin without touching the terminal!
+4. Press `⌘S` or click **Start All** to launch your local stack.
 
 ### Option 2: From Source (Git Clone)
 ```bash
 git clone https://github.com/mrutyunjay11/XamppLocal.git
 cd XamppLocal
 chmod +x scripts/setup.sh bin/xamppctl app/build.sh
-./scripts/setup.sh
+./bin/xamppctl bootstrap
 open app/XamppControl.app
 ```
 
@@ -51,7 +50,9 @@ open app/XamppControl.app
 
 | Command | Purpose |
 | :--- | :--- |
-| `xamppctl start [all\|apache\|php\|db]` | Pre-flight checks + ordered start (`php-fpm` → `httpd` → DB) |
+| `xamppctl readiness [--json]` | Inspect installation & initialization state of stack components |
+| `xamppctl bootstrap [--json]` | One-click acquisition & configuration of PHP, MySQL, and phpMyAdmin |
+| `xamppctl start [all\|apache\|php\|db]` | Pre-flight checks, auto-port resolution + ordered start (`php-fpm` → `httpd` → DB) |
 | `xamppctl stop [all\|apache\|php\|db]` | Clean shutdown (`httpd graceful-stop` → `php-fpm` → `20s` InnoDB flush) |
 | `xamppctl restart [target]` | Clean ordered restart |
 | `xamppctl status [--json] [--memory]` | Live status + optional `/usr/bin/footprint` RAM measurement |

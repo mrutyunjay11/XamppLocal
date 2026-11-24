@@ -9,3 +9,5 @@ config/httpd/vhosts.d/*.conf
 *.swo
 *~
 
+__pycache__/
+*.pyc

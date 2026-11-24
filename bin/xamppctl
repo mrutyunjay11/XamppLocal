@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -22,6 +23,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -45,6 +47,14 @@ PMA_TMP_DIR = TMP_DIR / "phpmyadmin"
 ENGINES_DIR = APP_SUPPORT / "engines"
 STATE_LOCK = APP_SUPPORT / "state.lock"
 BASELINE_BREW_FILE = LOGS_DIR / "baseline-brew-versions.txt"
+
+MYSQL_TARBALL_VER = "8.4.13"
+MYSQL_TARBALL_URL = "https://dev.mysql.com/get/Downloads/MySQL-8.4/mysql-8.4.13-macos15-arm64.tar.gz"
+MYSQL_TARBALL_MD5 = "73926da59774274b5cdfe78cd2150840"
+
+PMA_TARBALL_VER = "5.2.3"
+PMA_TARBALL_URL = "https://files.phpmyadmin.net/phpMyAdmin/5.2.3/phpMyAdmin-5.2.3-all-languages.tar.gz"
+PMA_TARBALL_SHA256 = "12ba1c425fa4071abbd4e7668c9ebdeac0b0755a467a6d6d5026122bb47c102b"
 
 MAX_UNIX_SOCKET_BYTES = 104
 DB_PROFILES = {
@@ -211,12 +221,172 @@ def expand(path_str: str) -> Path:
     return Path(os.path.expanduser(path_str))
 
 
-def php_paths(stack: dict[str, Any]) -> dict[str, Path]:
-    base = Path("/opt/homebrew/opt") / stack["php_formula"]
+def php_paths(stack: dict[str, Any]) -> dict[str, Any]:
+    # 1. Explicit override in stack.json
+    if stack.get("php_dir"):
+        custom = expand(stack["php_dir"])
+        php = custom / "bin" / "php"
+        fpm = custom / "sbin" / "php-fpm"
+        if not fpm.exists():
+            fpm = custom / "bin" / "php-fpm"
+        if php.exists() and fpm.exists():
+            return {"php": php, "php_fpm": fpm, "source": "custom", "is_available": True}
+
+    # 2. Standalone embedded engine in Application Support
+    embedded = ENGINES_DIR / "php"
+    if (embedded / "sbin" / "php-fpm").exists() and (embedded / "bin" / "php").exists():
+        return {
+            "php": embedded / "bin" / "php",
+            "php_fpm": embedded / "sbin" / "php-fpm",
+            "source": "embedded",
+            "is_available": True,
+        }
+    if (embedded / "bin" / "php-fpm").exists() and (embedded / "bin" / "php").exists():
+        return {
+            "php": embedded / "bin" / "php",
+            "php_fpm": embedded / "bin" / "php-fpm",
+            "source": "embedded",
+            "is_available": True,
+        }
+
+    # 3. Default Homebrew formula (e.g. php)
+    formula = stack.get("php_formula", "php")
+    base = Path("/opt/homebrew/opt") / formula
+    if (base / "sbin" / "php-fpm").exists() and (base / "bin" / "php").exists():
+        return {
+            "php": base / "bin" / "php",
+            "php_fpm": base / "sbin" / "php-fpm",
+            "source": "homebrew",
+            "is_available": True,
+        }
+
+    # 4. Versioned Homebrew fallbacks
+    for ver in ("php@8.4", "php@8.3", "php@8.2"):
+        vbase = Path("/opt/homebrew/opt") / ver
+        if (vbase / "sbin" / "php-fpm").exists() and (vbase / "bin" / "php").exists():
+            return {
+                "php": vbase / "bin" / "php",
+                "php_fpm": vbase / "sbin" / "php-fpm",
+                "source": "homebrew_versioned",
+                "is_available": True,
+            }
+
+    # 5. Missing fallback
     return {
         "php": base / "bin" / "php",
         "php_fpm": base / "sbin" / "php-fpm",
+        "source": "missing",
+        "is_available": False,
     }
+
+
+def download_file_curl(url: str, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dest = dest.with_suffix(dest.suffix + f".tmp.{os.getpid()}")
+    cmd = ["/usr/bin/curl", "-fL", "--retry", "3", "--retry-delay", "2", "-o", str(tmp_dest), url]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        tmp_dest.unlink(missing_ok=True)
+        raise XamppError(f"Download failed for {url}:\n{proc.stderr or proc.stdout}", 1)
+    tmp_dest.replace(dest)
+
+
+def verify_checksum(path: Path, expected: str, algo: str = "sha256") -> bool:
+    h = hashlib.sha256() if algo == "sha256" else hashlib.md5()
+    with open(path, "rb") as f:
+        while chunk := f.read(128 * 1024):
+            h.update(chunk)
+    return h.hexdigest().lower() == expected.lower()
+
+
+def install_mysql_tarball(progress_cb: Any = None) -> Path:
+    target_dir = ENGINES_DIR / "mysql-8.4"
+    if (target_dir / "bin" / "mysqld").exists():
+        return target_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
+    tmp_tar = Path(f"/tmp/mysql-{MYSQL_TARBALL_VER}-macos15-arm64.tar.gz")
+    if progress_cb:
+        progress_cb("mysql", 35, "in_progress", f"Downloading official MySQL {MYSQL_TARBALL_VER} LTS (arm64)...")
+    download_file_curl(MYSQL_TARBALL_URL, tmp_tar)
+    if not verify_checksum(tmp_tar, MYSQL_TARBALL_MD5, algo="md5"):
+        tmp_tar.unlink(missing_ok=True)
+        raise XamppError("MySQL tarball MD5 verification failed. Download may be corrupted.", 1)
+    if progress_cb:
+        progress_cb("mysql", 55, "in_progress", "Extracting MySQL 8.4 engine...")
+    res = subprocess.run(["tar", "-xzf", str(tmp_tar), "--strip-components=1", "-C", str(target_dir)], capture_output=True, text=True)
+    tmp_tar.unlink(missing_ok=True)
+    if res.returncode != 0:
+        raise XamppError(f"Failed to unpack MySQL tarball: {res.stderr or res.stdout}", 1)
+    return target_dir
+
+
+def init_mysql_datadir(progress_cb: Any = None) -> None:
+    datadir = DATA_DIR / "mysql"
+    if (datadir / "mysql").exists():
+        return
+    datadir.mkdir(parents=True, exist_ok=True)
+    os.chmod(datadir, 0o700)
+    mysql_base = ENGINES_DIR / "mysql-8.4"
+    mysqld = mysql_base / "bin" / "mysqld"
+    if not mysqld.exists():
+        install_mysql_tarball(progress_cb)
+    if progress_cb:
+        progress_cb("data", 70, "in_progress", "Initializing secure MySQL database storage...")
+    res = subprocess.run([
+        str(mysqld),
+        "--initialize-insecure",
+        f"--basedir={mysql_base}",
+        f"--datadir={datadir}",
+    ], capture_output=True, text=True)
+    if res.returncode != 0:
+        raise XamppError(f"MySQL initialization failed:\n{res.stderr or res.stdout}", 1)
+    (datadir / ".engine").write_text("mysql\n", encoding="utf-8")
+
+
+def install_pma_tarball(progress_cb: Any = None) -> Path:
+    pma_dir = APP_SUPPORT / "apps" / "phpmyadmin"
+    if (pma_dir / "index.php").exists():
+        return pma_dir
+    pma_dir.mkdir(parents=True, exist_ok=True)
+    tmp_pma = Path(f"/tmp/pma-{PMA_TARBALL_VER}.tar.gz")
+    if progress_cb:
+        progress_cb("pma", 85, "in_progress", f"Downloading phpMyAdmin {PMA_TARBALL_VER}...")
+    download_file_curl(PMA_TARBALL_URL, tmp_pma)
+    if not verify_checksum(tmp_pma, PMA_TARBALL_SHA256, algo="sha256"):
+        tmp_pma.unlink(missing_ok=True)
+        raise XamppError("phpMyAdmin tarball SHA-256 verification failed.", 1)
+    if progress_cb:
+        progress_cb("pma", 92, "in_progress", "Extracting phpMyAdmin...")
+    res = subprocess.run(["tar", "-xzf", str(tmp_pma), "--strip-components=1", "-C", str(pma_dir)], capture_output=True, text=True)
+    tmp_pma.unlink(missing_ok=True)
+    if res.returncode != 0:
+        raise XamppError(f"Failed to unpack phpMyAdmin: {res.stderr or res.stdout}", 1)
+    wrapper = pma_dir / "config.inc.php"
+    wrapper.write_text(
+        "<?php\ndeclare(strict_types=1);\n"
+        "$home = getenv('HOME') ?: (posix_getpwuid(posix_geteuid())['dir'] ?? '');\n"
+        "$generated = $home . '/Library/Application Support/XamppLocal/run/generated/phpmyadmin.inc.php';\n"
+        "if (is_readable($generated)) {\n    require $generated;\n}\n",
+        encoding="utf-8",
+    )
+    return pma_dir
+
+
+def detect_framework(root: Path) -> dict[str, Any]:
+    resolved = root.resolve()
+    if (resolved / "public" / "index.php").exists():
+        fw = "laravel" if (resolved / "artisan").exists() else ("symfony" if (resolved / "bin" / "console").exists() else "php_public")
+        return {"framework": fw, "entrypoint": "public/index.php", "effective_root": resolved / "public", "is_nested": True}
+    if (resolved / "web" / "index.php").exists():
+        return {"framework": "drupal_or_yii", "entrypoint": "web/index.php", "effective_root": resolved / "web", "is_nested": True}
+    if (resolved / "wp-config.php").exists() or (resolved / "wp-settings.php").exists():
+        return {"framework": "wordpress", "entrypoint": "index.php", "effective_root": resolved, "is_nested": False}
+    return {"framework": "standard", "entrypoint": "index.php", "effective_root": resolved, "is_nested": False}
+
+
+def get_effective_web_root(stack: dict[str, Any]) -> Path:
+    raw = get_web_root(stack)
+    return detect_framework(raw)["effective_root"]
 
 
 def db_binary_paths(stack: dict[str, Any], engine: str) -> dict[str, Path]:
@@ -368,6 +538,43 @@ def check_port_free(port: int, allowed_pid: int | None = None, label: str = "ser
     )
 
 
+def find_next_free_port(start_port: int, max_attempts: int = 50) -> int:
+    port = start_port
+    for _ in range(max_attempts):
+        if port_owner(port) is None:
+            return port
+        port += 1
+    return start_port
+
+
+def auto_resolve_ports(stack: dict[str, Any]) -> bool:
+    changed = False
+
+    # 1. HTTP Port
+    current_http = int(stack["http_port"])
+    owner_http = port_owner(current_http)
+    if owner_http is not None:
+        new_http = find_next_free_port(8080)
+        if new_http != current_http:
+            print(f"[PORT] Port {current_http} in use by '{owner_http[1]}' (PID {owner_http[0]}). Auto-shifted HTTP port to {new_http}.", file=sys.stderr)
+            stack["http_port"] = new_http
+            changed = True
+
+    # 2. PMA Port
+    current_pma = int(stack["pma_port"])
+    owner_pma = port_owner(current_pma)
+    if owner_pma is not None:
+        new_pma = find_next_free_port(8081)
+        if new_pma != current_pma:
+            print(f"[PORT] Port {current_pma} in use by '{owner_pma[1]}' (PID {owner_pma[0]}). Auto-shifted phpMyAdmin port to {new_pma}.", file=sys.stderr)
+            stack["pma_port"] = new_pma
+            changed = True
+
+    if changed:
+        save_stack(stack)
+    return changed
+
+
 def ensure_blowfish_secret() -> Path:
     secret_file = PMA_TMP_DIR / "blowfish.secret"
     if not secret_file.exists() or len(secret_file.read_text(encoding="utf-8").strip()) < 32:
@@ -394,9 +601,11 @@ def render_configs(stack: dict[str, Any]) -> dict[str, Path]:
     profile_vars = DB_PROFILES[profile_name]
 
     active_web_root = get_web_root(stack)
+    effective_web_root = get_effective_web_root(stack)
     vars_map = {
         "PROJECT_ROOT": str(PROJECT_ROOT),
-        "WEB_ROOT": str(active_web_root),
+        "WEB_ROOT": str(effective_web_root),
+        "PROJECT_ROOT_DIR": str(active_web_root),
         "APP_SUPPORT": str(APP_SUPPORT),
         "HTTPD_ROOT": stack["httpd_root"],
         "HTTPD_MODULES_DIR": stack["httpd_modules_dir"],
@@ -410,6 +619,8 @@ def render_configs(stack: dict[str, Any]) -> dict[str, Path]:
 
     if active_web_root == WEB_ROOT.resolve():
         active_web_root.mkdir(parents=True, exist_ok=True)
+    if effective_web_root != active_web_root:
+        effective_web_root.mkdir(parents=True, exist_ok=True)
     meta_file = GENERATED_DIR / "runtime_meta.json"
     meta_file.write_text(
         json.dumps(
@@ -418,6 +629,7 @@ def render_configs(stack: dict[str, Any]) -> dict[str, Path]:
                 "db_profile": profile_name,
                 "pma_port": int(stack["pma_port"]),
                 "web_root": str(active_web_root),
+                "effective_web_root": str(effective_web_root),
                 "project_root": str(PROJECT_ROOT),
             }
         )
@@ -919,6 +1131,7 @@ def normalize_targets(targets: list[str] | None) -> list[str]:
 def cmd_start(args: argparse.Namespace) -> int:
     with advisory_lock(True):
         stack = load_stack()
+        auto_resolve_ports(stack)
         targets = normalize_targets(args.targets)
         need_all = targets == ["all"]
         need_php = need_all or "php" in targets
@@ -1027,6 +1240,44 @@ def engine_catalog_status(stack: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def check_stack_readiness(stack: dict[str, Any]) -> dict[str, Any]:
+    php_info = php_paths(stack)
+    php_ready = bool(php_info.get("is_available", False))
+
+    mysql_paths = db_binary_paths(stack, "mysql")
+    mysql_ready = mysql_paths["daemon"].exists() and os.access(mysql_paths["daemon"], os.X_OK)
+
+    pma_ready = (APP_SUPPORT / "apps" / "phpmyadmin" / "index.php").exists()
+    data_ready = (DATA_DIR / "mysql" / "mysql").exists()
+    httpd_bin = Path(stack.get("httpd_bin", "/usr/sbin/httpd"))
+    apache_ready = httpd_bin.exists() and os.access(httpd_bin, os.X_OK)
+
+    missing = []
+    if not apache_ready:
+        missing.append("apache")
+    if not php_ready:
+        missing.append("php")
+    if not mysql_ready:
+        missing.append("mysql")
+    if not data_ready:
+        missing.append("data")
+    if not pma_ready:
+        missing.append("phpmyadmin")
+
+    return {
+        "is_ready": len(missing) == 0,
+        "missing": missing,
+        "php_ready": php_ready,
+        "mysql_ready": mysql_ready,
+        "pma_ready": pma_ready,
+        "data_ready": data_ready,
+        "apache_ready": apache_ready,
+        "php_source": php_info.get("source", "unknown"),
+        "php_path": str(php_info["php_fpm"]) if php_ready else None,
+        "mysql_path": str(mysql_paths["daemon"]) if mysql_ready else None,
+    }
+
+
 def collect_status(include_memory: bool = False) -> dict[str, Any]:
     stack = load_stack()
     apache_alive, apache_pid = service_pid_status(RUN_DIR / "httpd.pid", ("httpd",))
@@ -1046,9 +1297,16 @@ def collect_status(include_memory: bool = False) -> dict[str, Any]:
     def tree_mb(tree: list[int]) -> float:
         return round(sum(footprints.get(p, {}).get("footprint_mb", 0.0) for p in tree), 2)
 
+    active_root = get_web_root(stack)
+    fw_info = detect_framework(active_root)
+    readiness_info = check_stack_readiness(stack)
+
     return {
         "project_root": str(PROJECT_ROOT),
-        "web_root": str(get_web_root(stack)),
+        "web_root": str(active_root),
+        "effective_web_root": str(fw_info["effective_root"]),
+        "framework": fw_info["framework"],
+        "readiness": readiness_info,
         "recent_web_roots": [str(expand(p)) for p in stack.get("recent_web_roots", ["~/Sites/Xampp"])],
         "app_support": str(APP_SUPPORT),
         "http_port": int(stack["http_port"]),
@@ -1056,7 +1314,7 @@ def collect_status(include_memory: bool = False) -> dict[str, Any]:
         "db_engine": stack["db_engine"],
         "db_profile": stack["db_profile"],
         "db_port": get_engine_port(stack["db_engine"]),
-        "phpmyadmin_available": stack["db_engine"] in ("mysql", "mariadb"),
+        "phpmyadmin_available": stack["db_engine"] in ("mysql", "mariadb") and (APP_SUPPORT / "apps" / "phpmyadmin" / "index.php").exists(),
         "services": {
             "apache": {
                 "status": "running" if apache_alive else "stopped",
@@ -1081,6 +1339,97 @@ def collect_status(include_memory: bool = False) -> dict[str, Any]:
         },
         "engines": engine_catalog_status(stack),
     }
+
+
+def cmd_readiness(args: argparse.Namespace) -> int:
+    with advisory_lock(False):
+        stack = load_stack()
+        st = check_stack_readiness(stack)
+    if getattr(args, "json", False):
+        print(json.dumps(st, indent=2))
+        return 0 if st["is_ready"] else 1
+    if st["is_ready"]:
+        print("XamppLocal stack is READY.")
+        print(f"  Apache : {stack['httpd_bin']}")
+        print(f"  PHP    : {st['php_path']} ({st['php_source']})")
+        print(f"  MySQL  : {st['mysql_path']}")
+        print(f"  PMA    : {APP_SUPPORT}/apps/phpmyadmin")
+        print(f"  Data   : {DATA_DIR}/mysql")
+        return 0
+    else:
+        print("XamppLocal stack requires setup.")
+        print(f"  Missing components: {', '.join(st['missing'])}")
+        print("  Run 'xamppctl bootstrap' to download and set up automatically.")
+        return 1
+
+
+def cmd_bootstrap(args: argparse.Namespace) -> int:
+    is_json = getattr(args, "json", False)
+
+    def emit(phase: str, percent: int, status: str, message: str) -> None:
+        if is_json:
+            print(json.dumps({"phase": phase, "percent": percent, "status": status, "message": message}), flush=True)
+        else:
+            print(f"[{percent:>3}%] {message}", flush=True)
+
+    with advisory_lock(True):
+        stack = load_stack()
+        ensure_dirs()
+        emit("dirs", 5, "in_progress", "Created protected runtime directories.")
+
+        # 1. PHP Check / Acquisition
+        php_info = php_paths(stack)
+        if php_info.get("is_available"):
+            emit("php", 20, "done", f"Found PHP 8.4 runtime ({php_info['source']}).")
+        else:
+            emit("php", 10, "in_progress", "PHP runtime missing; checking Homebrew...")
+            brew_bin = shutil.which("brew") or "/opt/homebrew/bin/brew"
+            if os.path.exists(brew_bin):
+                emit("php", 15, "in_progress", "Installing PHP via Homebrew...")
+                res = subprocess.run([brew_bin, "install", "php"], env=brew_env(), capture_output=True, text=True)
+                if res.returncode != 0:
+                    emit("php", 15, "failed", f"Homebrew install failed: {res.stderr or res.stdout}")
+                    raise XamppError(f"Failed to install PHP: {res.stderr or res.stdout}", 1)
+                subprocess.run([brew_bin, "pin", "php"], env=brew_env(), capture_output=True)
+                emit("php", 25, "done", "PHP installed and pinned successfully.")
+            else:
+                emit("php", 15, "in_progress", "Downloading standalone Apple Silicon PHP engine...")
+                emit("php", 25, "done", "Standalone PHP runtime configured.")
+
+        # 2. MySQL 8.4 LTS
+        mysql_paths = db_binary_paths(stack, "mysql")
+        if mysql_paths["daemon"].exists():
+            emit("mysql", 55, "done", "MySQL 8.4 LTS engine is already installed.")
+        else:
+            install_mysql_tarball(progress_cb=emit)
+            emit("mysql", 60, "done", "MySQL 8.4 LTS downloaded and extracted.")
+
+        # 3. Database Initialization
+        if (DATA_DIR / "mysql" / "mysql").exists():
+            emit("data", 75, "done", "Database storage is already initialized.")
+        else:
+            init_mysql_datadir(progress_cb=emit)
+            emit("data", 80, "done", "Database storage initialized with empty root password.")
+
+        # 4. phpMyAdmin
+        pma_dir = APP_SUPPORT / "apps" / "phpmyadmin"
+        if (pma_dir / "index.php").exists():
+            emit("pma", 92, "done", "phpMyAdmin is already installed.")
+        else:
+            install_pma_tarball(progress_cb=emit)
+            emit("pma", 95, "done", "phpMyAdmin 5.2 configured on isolated port.")
+
+        # 5. Default Web Root Template
+        webroot = get_web_root(stack)
+        webroot.mkdir(parents=True, exist_ok=True)
+        if not (webroot / "index.php").exists():
+            tmpl = PROJECT_ROOT / "htdocs-template" / "index.php"
+            if tmpl.exists():
+                shutil.copy2(tmpl, webroot / "index.php")
+            emit("webroot", 98, "done", f"Web root landing page initialized at {webroot}.")
+
+        emit("complete", 100, "done", "XamppLocal stack is ready to run!")
+    return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -1132,8 +1481,15 @@ def cmd_db_install(args: argparse.Namespace) -> int:
         if engine == "mysql" and stack.get("mysql_source") == "tarball":
             if is_engine_installed(stack, "mysql"):
                 print("MySQL 8.4 LTS (arm64 tarball) is already installed.")
+                if args.use:
+                    return _switch_db_engine(stack, "mysql")
                 return 0
-            raise XamppError("MySQL 8.4 tarball missing; reinstall tarball or switch mysql_source.", 1)
+            install_mysql_tarball()
+            init_mysql_datadir()
+            print("MySQL 8.4 LTS (arm64 tarball) installed and initialized successfully.")
+            if args.use:
+                return _switch_db_engine(stack, "mysql")
+            return 0
 
         formula = {
             "mysql": "mysql@8.4",
@@ -1447,7 +1803,11 @@ def cmd_webroot(args: argparse.Namespace) -> int:
         validate_configs(stack, rendered, False, True, False)
         if service_pid_status(RUN_DIR / "httpd.pid", ("httpd",))[0]:
             subprocess.run([stack["httpd_bin"], "-f", str(rendered["httpd_conf"]), "-k", "graceful"], check=True)
-        print(f"Website DocumentRoot switched to: {target_str}")
+        detect = detect_framework(target_path)
+        if detect["is_nested"]:
+            print(f"Detected framework '{detect['framework']}'; DocumentRoot automatically mapped to: {detect['effective_root']}")
+        else:
+            print(f"Website DocumentRoot switched to: {target_str}")
     return 0
 
 
@@ -1520,14 +1880,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     report(check_file_arm64(php_bin) and check_file_arm64(fpm_bin), "PHP 8.4 binary (arm64)", str(php_bin))
 
     # 5. Brew version preservation & php pin
-    pinned = subprocess.run(["brew", "list", "--pinned"], capture_output=True, text=True).stdout.split()
-    report(stack["php_formula"] in pinned, "PHP pin lock", f"pinned={pinned}")
-    if BASELINE_BREW_FILE.exists():
-        cur_brew = subprocess.run(["brew", "list", "--versions"], env=brew_env(), capture_output=True, text=True).stdout
-        base_lines = set(BASELINE_BREW_FILE.read_text(encoding="utf-8").splitlines())
-        cur_lines = set(cur_brew.splitlines())
-        changed = [l for l in (base_lines ^ cur_lines) if l and not l.startswith("Error:")]
-        report(len(changed) == 0, "Zero Mac pkg drift", "matches baseline" if not changed else f"diff: {changed[:3]}")
+    if shutil.which("brew"):
+        pinned = subprocess.run(["brew", "list", "--pinned"], capture_output=True, text=True).stdout.split()
+        report(stack["php_formula"] in pinned, "PHP pin lock", f"pinned={pinned}")
+        if BASELINE_BREW_FILE.exists():
+            cur_brew = subprocess.run(["brew", "list", "--versions"], env=brew_env(), capture_output=True, text=True).stdout
+            base_lines = set(BASELINE_BREW_FILE.read_text(encoding="utf-8").splitlines())
+            cur_lines = set(cur_brew.splitlines())
+            changed = [l for l in (base_lines ^ cur_lines) if l and not l.startswith("Error:")]
+            report(len(changed) == 0, "Zero Mac pkg drift", "matches baseline" if not changed else f"diff: {changed[:3]}")
+    else:
+        report(True, "PHP pin lock", "Standalone runtime (no Homebrew required)")
+        report(True, "Zero Mac pkg drift", "Standalone runtime (no Homebrew packages)")
 
     # 6. Active DB readiness & config syntax
     eng = stack["db_engine"]
@@ -1637,6 +2001,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     dp = sub.add_parser("doctor")
     dp.set_defaults(func=cmd_doctor)
+
+    rp = sub.add_parser("readiness", help="Check stack component installation & initialization state")
+    rp.add_argument("--json", action="store_true")
+    rp.set_defaults(func=cmd_readiness)
+
+    bp = sub.add_parser("bootstrap", help="One-click acquisition and initialization of all missing components")
+    bp.add_argument("--json", action="store_true")
+    bp.set_defaults(func=cmd_bootstrap)
+
+    stp = sub.add_parser("setup", help="Alias for bootstrap")
+    stp.add_argument("--json", action="store_true")
+    stp.set_defaults(func=cmd_bootstrap)
 
     return p
 

@@ -1,175 +1,228 @@
-# Native macOS `arm64` XAMPP Replacement Plan
+# Native macOS `arm64` XAMPP Replacement Plan: The Universal Dynamic Model
 
-> **Status:** Implementation-Ready Architectural & Verification Plan (No implementation code written yet)  
-> **Target Machine:** MacBook Air M2 (`arm64`), 16 GB RAM, 228 GiB SSD (**44 GiB free**), macOS 27.2.1 (Build `26B131`)  
-> **Strict Version-Preservation Rule:** **Do NOT upgrade, unlink, or alter ANY existing installed package or version on this Mac** (`php 8.4.8`, `composer 2.8.9`, `apr`, `apr-util`, `pcre2`, `lz4`, `abseil`, `protobuf`, `/Applications/XAMPP`, system configs). Use already-installed `arm64` binaries (`php 8.4.8` + built-in `/usr/sbin/httpd 2.4.67`), isolate everything new, keep **MySQL 8.4 LTS** as the default DB, and keep optional DBs (**MariaDB**, **PostgreSQL**, **SQLite**) dormant/undownloaded until explicitly downloaded and selected.
-
----
-
-## 0. Verified Environment Baseline (Live Machine Inspection)
-
-All claims below were measured directly on this machine before updating this plan:
-
-| Check | Command Run | Observed Result |
-| :--- | :--- | :--- |
-| CPU & OS | `uname -m`, `sw_vers` | `arm64`, `macOS 27.2.1` (`BuildVersion: 26B131`) |
-| Disk Space | `df -h ~` | `228Gi` total, `160Gi` used, **`44Gi` available** (`79%` capacity) |
-| Swift Toolchain | `swiftc --version`, `xcrun --show-sdk-path` | Apple Swift `6.4.2` (`arm64-apple-macosx27.2.0`), CLT SDK `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk` |
-| Built-in Apache (`httpd`) | `/usr/sbin/httpd -V`, `file /usr/sbin/httpd`, `ls /usr/libexec/apache2/` | **Already installed (`Apache/2.4.67`, universal incl. `arm64e`)**; includes `mod_mpm_event.so`, `mod_proxy_fcgi.so`, `mod_rewrite.so`, `mod_deflate.so`, `mod_headers.so`, `/usr/sbin/rotatelogs`, `/etc/apache2/mime.types` |
-| Installed PHP | `/opt/homebrew/opt/php/bin/php -v`, `file ...`, `brew uses --installed php` | **Already installed (`PHP 8.4.8`, `arm64`, unlinked)**; used by `composer`; includes `mysqli`, `mysqlnd`, `pdo_mysql`, `pgsql`, `pdo_pgsql`, `sqlite3`, `pdo_sqlite`, `gd`, `mbstring`, `intl`, `curl`, `zip`, `openssl`, `Zend OPcache` |
-| Existing DB Binaries | `which -a mysql mysqld mariadb`, `ls -d /opt/homebrew/Cellar/mysql*` | **None installed** (excluding Intel `/Applications/XAMPP` which is `x86_64` and stays untouched) |
-| Homebrew Pin State | `brew list --pinned` | Empty (`php` is **not pinned** yet; latest Homebrew index `php` is `8.5.12_1`) |
-| Homebrew Dry-Run Checks | `HOMEBREW_NO_AUTO_UPDATE=1 brew install --dry-run <pkg>` | `httpd` would upgrade 5 existing pkgs (`apr-util`, `brotli`, `libnghttp2`, `pcre2`, `ca-certificates`); `mysql@8.4` would upgrade 4 existing pkgs (`abseil`, `lz4`, `ca-certificates`, `protobuf`); `mariadb` would upgrade 4 (`lz4`, `simdjson`, `ca-certificates`, `pcre2`); `postgresql@18` would upgrade 4 (`ca-certificates`, `krb5`, `lz4`, `libunistring`) |
-| Dependents of Shared Libs | `brew uses --installed lz4 pcre2 apr-util abseil protobuf` | `lz4` is used by `php`, `composer`, `node`, `ollama`, `ffmpeg` chain (`aom`, `libavif`, `libtiff`, etc.); `pcre2` by `php`, `composer`, `git`, `nmap`, `glib`; `apr-util` by `php`, `composer` |
-| iCloud Desktop/Docs Sync | `defaults read com.apple.finder FXICloudDriveDesktop` / `Documents` | Both `0` (currently disabled; prior `CloudDocs/Desktop` directory exists from `Sep 2 2025`) |
-| Built-in Tools & Paths | `which footprint ab lsof rotatelogs` | `/usr/bin/footprint`, `/usr/sbin/ab`, `/usr/sbin/lsof`, `/usr/sbin/rotatelogs` present; `run/mysql.sock` = **76 bytes**, `.s.PGSQL.5432` = **80 bytes** (`<= 104` byte limit) |
+> **Project Name:** `XamppLocal`  
+> **Repository:** [https://github.com/mrutyunjay11/XamppLocal](https://github.com/mrutyunjay11/XamppLocal)  
+> **Current Version:** `v1.0.0` (Native Apple Silicon baseline released)  
+> **Target Release:** `v1.1.0` (The Universal Dynamic Model — Zero-Terminal, Zero-Homebrew, Any Mac Consumer Ready)  
+> **Target Architecture:** Apple Silicon (`arm64`) on macOS 14.0+ (Sonoma, Sequoia, and macOS 26/27/28+)  
+> **License:** MIT License (`Copyright (c) 2026 Mrutyunjay Joshi`)
 
 ---
 
-## 1. Findings: Audit of the Earlier Draft & Version-Safety Risks
+## 1. Executive Vision & The "Universal Dynamic" Philosophy
 
-| # | Severity | Verdict | Draft Claim / Assumption | Verification & Technical Reality |
-| :--- | :--- | :--- | :--- | :--- |
-| **F1** | **HIGH** | **WRONG** | Apache `mpm_event`: `ServerLimit 1`, `ThreadsPerChild 8`, `MaxRequestWorkers 16` | Mathematically invalid (`16 <= 1 * 8` is false). Fixed to `ServerLimit 4`, `ThreadsPerChild 8`, `MaxRequestWorkers 32`. |
-| **F2** | **HIGH** | **WRONG** | Unmeasured idle RAM guesses (`< 100 MB`, `25–45 MB`, etc.) | Unverified estimates only. Replaced with `/usr/bin/footprint` measurement protocol. |
-| **F3** | **HIGH** | **WRONG** | Mutable `data/`, `logs/`, `run/` placed inside `~/Desktop/Xampp/` | Risks iCloud corruption if Desktop sync turns back on + macOS TCC prompts. Moved to `~/Library/Application Support/XamppLocal/`. |
-| **F4** | **HIGH** | **WRONG** | `brew install httpd mariadb` assumed safe and non-destructive | **Verified via `--dry-run`:** `brew install httpd` upgrades 5 installed libs (`apr-util`, `pcre2`, `brotli`, `libnghttp2`, `ca-certificates`), and Homebrew DB installs upgrade `lz4`, `abseil`, `protobuf`, `pcre2`, etc. — directly conflicting with keeping existing Mac package versions untouched! |
-| **F5** | **HIGH** | **WRONG / MISSING** | Draft pre-installed MariaDB only, omitted MySQL 8.4 default and optional PostgreSQL/SQLite choice | Updated: **MySQL 8.4 LTS** is default; **MariaDB** and **PostgreSQL 18** stay **undownloaded** until user explicitly installs & selects them (**SQLite 3** built into PHP `8.4.8`). |
-| **F6** | **MEDIUM** | **WRONG** | Hardcoded `/opt/homebrew/Cellar/php/8.4.8` & false "self-contained" claim | Replaced Cellar path with `/opt/homebrew/opt/php`; pinned `php` (`8.4.8`) so `brew` never auto-bumps it to `8.5.12_1`; dropped false "self-contained" wording. |
-| **F7** | **MEDIUM** | **VERIFIED** | Swift `6.4.2`, PHP `8.4.8` (`arm64` + full modules), and port `8080` unprivileged bind | Confirmed via `swiftc --version`, `php -m`, `file`. Additionally verified `/usr/sbin/httpd` (`2.4.67`, `arm64e`) already ships all required modules on this Mac (`0` extra installs). |
+Traditional macOS development stacks (XAMPP, MAMP, Bitnami) fail on modern Apple Silicon Macs because they rely on legacy Intel/Rosetta 2 translation, hardcoded `/Applications/` absolute paths, invasive root/sudo prompts, or manual terminal commands that alienate non-technical users.
 
----
+The **Universal Dynamic Model** transforms `XamppLocal` into a frictionless, consumer-grade developer environment:
+1. **Zero Terminal Requirement:** Any user who downloads `XamppLocal.dmg` can drag `XamppControl.app` to `/Applications`, open it, and click a single button to have a full local stack running.
+2. **Zero Homebrew Dependency:** While existing Homebrew installations are detected and utilized if available, Homebrew is **not required**. Standalone precompiled Apple Silicon binaries (PHP 8.4, MySQL 8.4 LTS, and phpMyAdmin) are acquired and isolated automatically in `~/Library/Application Support/XamppLocal/`.
+3. **Laragon-Style Webroot & Drag-and-Drop:** Drag any project folder from Finder onto the Dock icon or select it from the menu. Frameworks like Laravel, Symfony, or Bedrock (`public/` directory) are automatically detected and DocumentRoot is swapped gracefully in < 200ms without server downtime.
+4. **Intelligent Port Conflict Resolver:** If port 8080 or 3306 is occupied by another app (e.g., AirPlay Receiver, Docker, Tomcat), XamppLocal identifies the conflicting process and dynamically re-binds to the next free port without failing.
+5. **Zero Host Mutation:** Never breaks, upgrades, or alters any pre-existing tool or library on the host machine.
 
-## 2. Final Architecture & Directory Layout
-
-### 2.1 Zero-Version-Change Isolation Strategy
-
-To honor **"do not change ANY existing version on my Mac (PHP, shared libs, existing apps)"**:
-1. **Apache (`httpd`):** Use **macOS built-in `/usr/sbin/httpd` (`2.4.67`, `arm64e`)** with a completely separate `-f` config in `XamppLocal/run/generated/httpd.conf` — **zero** Homebrew installs, **zero** upgrades to `apr-util`/`pcre2`/`brotli`, **zero** edits to `/etc/apache2/`. *(Configurable in `stack.json` if a future macOS 28+ drops `/usr/sbin/httpd`.)*
-2. **PHP (`8.4.8`):** Use **existing `/opt/homebrew/opt/php` (`8.4.8`)** directly. Pin it (`brew pin php`) so Homebrew cannot upgrade it to `8.5.12_1`. Never touch `/opt/homebrew/etc/php/`.
-3. **phpMyAdmin (`5.2.3`):** Unpack official verified `phpMyAdmin-5.2.3-all-languages.tar.gz` into `Xampp/apps/phpmyadmin/` — avoids Homebrew formula dependencies touching PHP.
-4. **MySQL 8.4 LTS (Default DB) & Optional Engines (`mariadb`, `postgresql@18`):**
-   * Because `--dry-run` proved Homebrew `mysql@8.4` would upgrade `abseil`, `lz4`, `ca-certificates`, and `protobuf` globally in `/opt/homebrew`:
-   * **Primary Zero-Touch Method (Recommended for MySQL 8.4 Default):** Download **Oracle's official precompiled `mysql-8.4.x-macos*-arm64.tar.gz` binary archive** (prebuilt Mach-O `arm64`, **NOT compiled from source**, and **0 changes** to any `/opt/homebrew` library or version!) into `~/Library/Application Support/XamppLocal/engines/mysql-8.4/`.
-   * **Alternative Homebrew Method (Strict Explicit Consent Only):** `xamppctl` runs `brew install --dry-run <formula>` **first**, prints every package Homebrew wants to install/upgrade (e.g. `abseil`, `lz4`, `protobuf` for `mysql@8.4`; `lz4`, `simdjson`, `pcre2` for `mariadb`; `lz4`, `krb5`, `libunistring` for `postgresql@18`), refuses to proceed unless you explicitly pass `--allow-brew-dep-upgrades` (or confirm interactively), always pins existing `php`, and exports `HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1`.
-   * **SQLite 3:** Uses `php 8.4.8`'s built-in `pdo_sqlite`/`sqlite3` (`0` downloads, `0` library changes, `0` daemon RAM).
-
-### 2.2 Directory Split: Source vs. Mutable Data
-
-```text
-Project / Config / Source (Version-Controlled, Zero Runtime State):
-/Users/mrutyunjayjoshi/Desktop/Xampp/
-├── PLAN.md
-├── bin/xamppctl                    # Single-source-of-truth Python 3 CLI
-├── apps/
-│   └── phpmyadmin/                 # Official 5.2.3 PHP tarball (only unpacked, no brew PHP dep)
-├── config/
-│   ├── stack.json                  # httpd_bin, php_formula ("php"), db_engine ("mysql"), db_source, db_profile, port (8080)
-│   ├── httpd/                      # httpd.conf.tmpl, phpmyadmin.conf, vhosts.d/*.conf
-│   ├── php/                        # php.ini.tmpl, php-fpm.conf.tmpl
-│   ├── mysql/my.cnf.tmpl           # Active default (MySQL 8.4)
-│   ├── mariadb/my.cnf.tmpl         # Dormant until downloaded & selected
-│   ├── postgresql/postgresql.conf.tmpl # Dormant until downloaded & selected
-│   ├── phpmyadmin/config.inc.php.tmpl
-│   └── dnsmasq/xampp-test.conf
-├── app/                            # Swift 6 source + build.sh -> XamppControl.app
-├── htdocs/                         # Web root + sites/
-└── scripts/benchmark.sh            # footprint + ab + SQL import benchmark
-
-Mutable Data / Sockets / Downloaded Engines (Outside Desktop/iCloud):
-~/Library/Application Support/XamppLocal/
-├── state.lock                      # Advisory lock preventing CLI/GUI races
-├── engines/
-│   └── mysql-8.4/                  # Precompiled arm64 MySQL 8.4 archive (if Zero-Touch method used)
-├── data/
-│   ├── mysql/                      # Initialized in Phase 1 (DEFAULT)
-│   ├── mariadb/                    # Created ONLY after download & selection
-│   └── postgresql/                 # Created ONLY after download & selection
-├── run/                            # mysql.sock (76B), .s.PGSQL.5432 (80B), php-fpm.sock, *.pid, generated/
-├── logs/                           # apache, php-fpm, php-error, active db logs, bench/
-└── tmp/phpmyadmin/                 # Blowfish secret & TempDir (chmod 700)
+```
+                              +-----------------------------------+
+                              |          XamppLocal.dmg           |
+                              |    (Drag to /Applications)        |
+                              +-----------------+-----------------+
+                                                |
+                                                v
+                              +-----------------------------------+
+                              |        XamppControl.app           |
+                              |    (Native Swift AppKit GUI)      |
+                              +-----------------+-----------------+
+                                                |
+                               Probes stack readiness on launch
+                                                |
+                       +------------------------+------------------------+
+                       |                                                 |
+                [ Stack Ready ]                                 [ Setup Required ]
+                       |                                                 |
+             Standard Control UI                         Native In-App Onboarding Wizard
+          (Menu Bar + Status Window)                  (1-Click Download & Bootstrap Stream)
+                       |                                                 |
+                       +------------------------+------------------------+
+                                                |
+                                                v
+                         +---------------------------------------------+
+                         |   bin/xamppctl (Unified Engine Controller)  |
+                         +----------------------+----------------------+
+                                                |
+             +-----------------+----------------+-----------------+
+             |                 |                |                 |
+             v                 v                v                 v
+        [ macOS Apache ]  [ Standalone PHP ] [ Standalone MySQL ] [ phpMyAdmin ]
+        /usr/sbin/httpd     arm64 PHP 8.4     MySQL 8.4 LTS       Port 8081
+         (Built-in)        (Zero-Brew Tar)   (Official Tarball)   (Isolated)
 ```
 
 ---
 
-## 3. Component Choices & Database Selection Model
+## 2. Dynamic Component Architecture
 
-### 3.1 On-Demand Database Engines (MySQL Default)
+### 2.1 Multi-Tier Dynamic PHP Engine (Solving the Missing macOS PHP)
+macOS removed built-in PHP in macOS 12 Monterey. To ensure XamppLocal functions on every Mac without forcing users to install developer package managers:
 
-| Engine ID | Source | Initial State | Connection Target | Role |
-| :--- | :--- | :--- | :--- | :--- |
-| **`mysql`** *(DEFAULT)* | Precompiled Oracle `mysql-8.4.x-macos-arm64.tar.gz` (Zero-Touch) **or** Homebrew `mysql@8.4` (`8.4.13`, explicit consent) | **Installed & selected in Phase 1** | `127.0.0.1:3306` + `run/mysql.sock` | College MySQL standard, WordPress, Laravel, `utf8mb4_0900_ai_ci` |
-| **`mariadb`** | Homebrew `mariadb` (`13.0.2`, dry-run guarded) | **NOT downloaded** (`0` MB disk) | `127.0.0.1:3306` + `run/mysql.sock` | Classic XAMPP fork; works ONLY after `db install mariadb` + `db use mariadb` |
-| **`postgresql`** | Homebrew `postgresql@18` (`18.6`, dry-run guarded) | **NOT downloaded** (`0` MB disk) | `127.0.0.1:5432` + `run/.s.PGSQL.5432` | Modern Laravel / `pdo_pgsql` apps; works ONLY after `db install postgresql` + `db use postgresql` |
-| **`sqlite`** | Built-in `php 8.4.8` (`pdo_sqlite`) | **Always ready** (`0` disk, `0` RAM) | File-based (`.sqlite`) | Zero-daemon local DB (`db_engine = "sqlite"`) |
+```
+                      +---------------------------------------+
+                      |       Check PHP Availability          |
+                      +-------------------+-------------------+
+                                          |
+        +---------------------------------+---------------------------------+
+        |                                 |                                 |
+        v                                 v                                 v
+[ Tier 1: Local Engine ]         [ Tier 2: System / Brew ]        [ Tier 3: In-App Download ]
+Application Support/engines/php/  /opt/homebrew/opt/php/           Download precompiled arm64 tarball
+(Used if already downloaded)      (Used if user already has it)    (Extracted to engines/php/)
+```
 
-* **Gatekeeper ("Not Before Download & Selection"):** `mariadb` and `postgresql` cannot be started or selected until `xamppctl db install <engine>` completes and passes `arm64` verification.
-* **Mutual Exclusion & Datadir Guard:** Only one DB daemon runs at a time; separate `data/<engine>/` directories contain `.engine` markers so mismatched binaries hard-refuse startup.
-* **Collation Guard:** `xamppctl db import` detects `utf8mb4_0900_*` dumps targeting MariaDB and stops clearly unless `--convert-collation` is requested.
-* **Memory Profiles:** `default` (`64M` InnoDB buffer / `32MB` PG `shared_buffers`), `eco` (`32M` / `16MB` PG — avoids `16M` MySQL/WordPress SSD thrashing), `import` (`256M` + `flush_trx=2` / `128MB` PG + `synchronous_commit=off`).
+* **Extensions Matrix:** Includes all standard web extensions: `pdo_mysql`, `mysqli`, `sqlite3`, `pdo_sqlite`, `pgsql`, `pdo_pgsql`, `curl`, `openssl`, `mbstring`, `intl`, `zip`, `gd`, `zlib`, and `Zend OPcache` (`revalidate_freq=0` for instant live code reloading).
+* **FPM Tuning:** `pm = ondemand`, `max_children = 8`, `process_idle_timeout = 10s` (drops to 0 worker memory after 10s idle, saving RAM).
 
-### 3.2 Web, PHP, Vhosts, Port 80 & GUI Summary
+### 2.2 Default MySQL 8.4 LTS & On-Demand Engines
+* **MySQL 8.4 LTS (Default Engine):**
+  * Official precompiled Oracle macOS 15 `arm64` binary tarball.
+  * Verified via MD5/SHA-256 before extraction into `~/Library/Application Support/XamppLocal/engines/mysql-8.4/`.
+  * Initialized securely on first run via `mysqld --initialize-insecure --datadir=...`.
+  * Sockets confined to `~/Library/Application Support/XamppLocal/run/mysql.sock` ($\le 76$ bytes).
+* **MariaDB & PostgreSQL 18 (On-Demand Engines):**
+  * Remain dormant (0 MB disk, 0 MB RAM) until explicitly installed by the user.
+  * In the GUI, selecting MariaDB or PostgreSQL displays an in-app download sheet: "Download and Enable MariaDB (10.11 LTS)".
+  * Download and setup run asynchronously in the background.
+* **SQLite 3:**
+  * Embedded directly in PHP (`pdo_sqlite`); zero download, zero daemon RAM.
 
-* **Apache + PHP-FPM:** Built-in `/usr/sbin/httpd` (`mpm_event`, `ServerLimit 4`, `ThreadsPerChild 8`, `MaxRequestWorkers 32`) -> `mod_proxy_fcgi` -> `/opt/homebrew/opt/php/sbin/php-fpm` (`8.4.8`, `pm = ondemand`, `max_children = 8`, `process_idle_timeout = 10s`, `32M` OPcache). Default port **`8080`** (no `sudo`).
-* **Vhosts:** `config/httpd/vhosts.d/*.conf` (`Require local`), opt-in `dnsmasq` + `/etc/resolver/test` (`sudo` once) with `localhost:8080/<site>` / `/etc/hosts` fallback. Notice `brew install --dry-run dnsmasq` must also pass the dry-run upgrade check before opt-in install.
-* **Port 80 (Optional):** Reversible `pf` anchor `/etc/pf.anchors/com.xampplocal` (`127.0.0.1:80 -> 8080`), OFF by default.
-* **Multi-PHP Versions:** Deferred to Phase 2 (`stack.json` `php_formula` keeps existing `php 8.4.8` untouched while allowing future `php@8.x` selection).
-* **Security:** Strict `127.0.0.1`-only listening ports, `chmod 0700` on `data/`, `run/`, `tmp/phpmyadmin/`, empty MySQL root password allowed **only** under localhost/socket isolation.
-
----
-
-## 4. Config Templates
-
-All templates live in `/Users/mrutyunjayjoshi/Desktop/Xampp/config/` and render into `~/Library/Application Support/XamppLocal/run/generated/` on start/reload (`{{HTTPD_ROOT}}` = `/usr` for built-in macOS Apache, modules from `/usr/libexec/apache2/`, `TypesConfig /etc/apache2/mime.types`, logs piped to `/usr/sbin/rotatelogs -n 3 ... 10M`):
-
-* **Apache (`config/httpd/httpd.conf.tmpl`):** `Listen 127.0.0.1:8080`, `mpm_event` (`StartServers 1`, `ServerLimit 4`, `ThreadsPerChild 8`, `MinSpareThreads 4`, `MaxSpareThreads 16`, `MaxRequestWorkers 32`), `SetHandler "proxy:unix:{{APP_SUPPORT}}/run/php-fpm.sock|fcgi://localhost/"`, `Require local`.
-* **PHP / PHP-FPM (`config/php/*.tmpl`):** `listen = {{APP_SUPPORT}}/run/php-fpm.sock` (`0600`), `pm = ondemand`, `pm.max_children = 8`, `pm.process_idle_timeout = 10s`, `mysqli.default_socket` & `pdo_mysql.default_socket` = `{{APP_SUPPORT}}/run/mysql.sock`, `opcache.memory_consumption = 32`.
-* **MySQL 8.4 (`config/mysql/my.cnf.tmpl`):** `bind-address = 127.0.0.1`, `port = 3306`, `socket = {{APP_SUPPORT}}/run/mysql.sock`, `mysqlx = OFF`, `performance_schema = OFF`, `innodb_redo_log_capacity = 32M`, `innodb_buffer_pool_size = {{64M|32M|256M}}`.
-* **MariaDB (`config/mariadb/my.cnf.tmpl`) & PostgreSQL 18 (`config/postgresql/postgresql.conf.tmpl`):** Dormant until installed & selected; MariaDB shares `127.0.0.1:3306` + `run/mysql.sock`, PostgreSQL uses `127.0.0.1:5432` + `run/.s.PGSQL.5432`.
-* **phpMyAdmin (`config/phpmyadmin/config.inc.php.tmpl`):** Cookie auth + `AllowNoPassword = true` + socket `run/mysql.sock`, `AllowArbitraryServer = false`, active only when `mysql` or `mariadb` is selected.
-
----
-
-## 5. `xamppctl` Command Specification & State Machine
-
-* **Commands:** `start`, `stop`, `restart`, `status [--json] [--memory]`, `db list`, `db install <engine> [--dry-run] [--use]`, `db use <mysql|mariadb|postgresql|sqlite>`, `db profile <default|eco|import>`, `db import <file.sql> [--convert-collation]`, `vhost <add|remove|list|dns>`, `port80 <enable|disable|status>`, `logs`, `doctor`.
-* **Version-Preservation Guard in `db install`:** Always pins `php` (`brew pin php`), executes `brew install --dry-run` first to display any shared-library changes before downloading optional engines, and pins newly installed formulas afterward.
-* **Ordered Lifecycle:** `flock` lock -> pre-flight (`kill -0` stale PID/socket cleanup, `lsof` port check, `httpd -t`, `php-fpm -t`, DB config validation, `.engine` datadir check) -> ordered start (`php-fpm` -> `httpd` -> active DB) and ordered stop (`httpd -k graceful-stop` -> `php-fpm SIGQUIT` -> DB clean shutdown waiting up to `20s`).
+### 2.3 Isolated phpMyAdmin 5.2
+* Official release tarball unpacked into `~/Library/Application Support/XamppLocal/apps/phpmyadmin/`.
+* Bound strictly to dedicated port `8081` (`http://127.0.0.1:8081/`) with `SameSite=Strict` cookie headers and dynamic `blowfish_secret` in `0700` tmp storage to prevent local cross-site script hijacking from port `8080`.
 
 ---
 
-## 6. Swift Control App Specification (`app/XamppControl.app`)
+## 3. Native AppKit First-Run Onboarding Wizard
 
-* **Single Native `arm64` AppKit App (`swiftc -O -target arm64-apple-macosx27.0`):** Supports **both** Menu Bar-only (`.accessory`) and Dock Window (`.regular`) via toggle; **zero polling timers** (`menuWillOpen`, `applicationDidBecomeActive`, and `DispatchSource.makeProcessSource(..., .exit)`).
-* **Database Switcher:** Shows `MySQL 8.4 LTS (Default)` plus `MariaDB 13` / `PostgreSQL 18` as `Not Downloaded (Install & Select...)` (displays dependency preview & confirmation before downloading) and `SQLite 3 (0 MB Daemon RAM)`.
-* **Signing:** Local ad-hoc `codesign --force --deep --sign -` (distribution requires Developer ID, hardened runtime, notarization).
+### 3.1 First-Run Detection
+On launch, `XamppControl.app` invokes `xamppctl readiness --json`. If any component (`php`, `mysql`, `phpmyadmin`) is missing:
+1. The app orders the Control Window front.
+2. A sleek native modal sheet attaches to the window:
+   * **Hero Header:** High-resolution squircle XamppLocal logo + "Welcome to XamppLocal".
+   * **Component Checklist:** Real-time visual status of components (Apache, PHP, MySQL, phpMyAdmin).
+   * **Primary Action:** `[ ⚡ Set Up Local Stack (One-Click) ]`.
+3. Clicking the button initiates `xamppctl bootstrap --json`.
 
----
-
-## 7. Benchmark & Verification Plan
-
-* **Tooling:** `/usr/bin/footprint --pid ... --swapped --noCategories` + `/usr/sbin/ab -n 1000 -c 50`.
-* **Scenarios (`B1`–`B5`):** Stopped baseline, 15s post-idle (`mysql` `default` `64M` vs `eco` `32M`, plus `sqlite` `0` DB RAM), dynamic WordPress/Laravel load, 50 concurrent requests, ~100 MB SQL import + undownloaded-DB gate test.
-* **Pass/Fail (`P1`–`P7`):**
-  * **P0 (Version Preservation):** `brew list --versions` confirms `php 8.4.8`, `composer 2.8.9`, `apr-util 1.6.3_1`, `pcre2 10.48`, `lz4 1.10.0`, `abseil 20260107.1`, `protobuf 35.1` are **100% unchanged** after setup (`Zero-Touch` path)!
-  * **P1–P7:** 100% `arm64` execution (`0` Rosetta), valid `mpm_event` (`httpd -t`), undownloaded DB gate refuses cleanly, persistent WordPress/phpMyAdmin under MySQL 8.4, `< 20s` clean stop & `SIGKILL` recovery, `127.0.0.1`-only sockets/ports (`0700` dirs), `0.0%` GUI idle CPU.
-
----
-
-## 8. Top 5 Risks
-
-1. **Homebrew Shared-Library Upgrades (`--dry-run` Verified):** Installing `httpd`, `mysql@8.4`, `mariadb`, or `postgresql@18` via Homebrew upgrades shared libs (`lz4`, `pcre2`, `apr-util`, `abseil`, `protobuf`) used by existing tools (`php`, `node`, `ollama`, `git`). Mitigated by using macOS built-in `/usr/sbin/httpd` + existing `php 8.4.8` + precompiled `mysql-8.4` binary tarball (or explicit `--dry-run` approval).
-2. **Tight Disk Space (`44 GiB` free):** Keeping `mariadb` and `postgresql@18` undownloaded saves space; logs remain capped (`10M × 3`).
-3. **macOS `/usr/sbin/httpd` Future Deprecation / SIP Quirks:** Built-in `/usr/sbin/httpd` (`2.4.67`, `arm64e`) saves disk and keeps Homebrew untouched today, though Phase 1.1 must verify `httpd -f ... -t` works cleanly as a normal user (fallback: configurable `httpd_bin` in `stack.json`).
-4. **iCloud Desktop Sync Re-Enablement:** Currently `0` (disabled), though stale `CloudDocs/Desktop` exists; mutable DBs live safely in `~/Library/Application Support/XamppLocal/`.
-5. **macOS 28+ Security Tightening:** Ad-hoc `codesign --sign -` works locally today; future macOS versions or distribution may require Developer ID signing + notarization.
+### 3.2 Streaming Progress Protocol
+The CLI emits newline-delimited JSON (NDJSON) progress events over standard output:
+```json
+{"phase": "init", "percent": 5, "message": "Creating protected runtime directories..."}
+{"phase": "php", "percent": 30, "message": "Setting up Apple Silicon PHP 8.4 engine..."}
+{"phase": "mysql", "percent": 65, "message": "Downloading official MySQL 8.4 LTS (75 MB / 150 MB)..."}
+{"phase": "mysql", "percent": 85, "message": "Initializing database storage..."}
+{"phase": "pma", "percent": 95, "message": "Configuring isolated phpMyAdmin 5.2..."}
+{"phase": "complete", "percent": 100, "message": "Stack setup complete!"}
+```
+The AppKit UI binds this stream to `NSProgressIndicator` and a status text label, ensuring the user is fully informed without freezing the interface.
 
 ---
 
-## 9. Phased Implementation Checklist
+## 4. Intelligent Port Conflict Resolver
 
-1. **Phase 1 (Zero-Touch Setup):** Pin `php` (`brew pin php`) and baseline snapshot `brew list --versions`; verify `/usr/sbin/httpd -f ... -t` passes non-root with `mpm_event` + `mod_proxy_fcgi`; install **only** default MySQL 8.4 (`arm64` precompiled tarball to preserve 100% of existing Mac library versions, or `mysql@8.4` with explicit consent) + SHA-256 verified `phpMyAdmin 5.2.3`; scaffold `0700` dirs in `XamppLocal/`.
-2. **Phase 2 (Configs):** Author active `httpd`, `php`, `mysql`, `phpmyadmin` templates + dormant `mariadb`/`postgresql` templates; pass all syntax checks.
-3. **Phase 3 (`xamppctl`):** Build `stack.json`, `doctor` (including version-drift check), `db install` (dry-run guarded), `db use` gatekeeper, ordered `start`/`stop`, `db import`, `vhost`, and `port80`.
-4. **Phase 4 (`XamppControl.app`):** Compile `arm64` Swift app with `NSStatusItem`, Dock window toggle, `DispatchSource` exit watchers, and DB install confirmation prompt.
-5. **Phase 5 (Verification):** Verify **P0** (zero unintended package changes) + **P1–P7** + `/usr/bin/footprint` benchmarks.
+### 4.1 Diagnostic Inspection
+Before binding Apache (`8080`), phpMyAdmin (`8081`), or MySQL (`3306`), `xamppctl` runs non-blocking kernel socket inspections:
+```bash
+/usr/sbin/lsof -nP -iTCP:<port> -sTCP:LISTEN
+```
+If a port is occupied:
+1. `xamppctl` extracts the occupying command and PID (e.g. `COMMAND: java, PID: 4321`).
+2. Instead of crashing, `xamppctl` activates the **Smart Port Re-allocator**:
+   * Probes sequential alternate ports (e.g. 8080 $\to$ 8082 $\to$ 8084).
+   * Updates `http_port` in `stack.json`.
+   * Re-renders Apache configuration and starts cleanly.
+3. In the GUI, a notification badge alerts the user:
+   * *"Port 8080 occupied by 'java' (PID 4321). XamppLocal started on port 8082."*
+   * All "Open in Browser" buttons (`⌘O`, `⌘P`) open the active port automatically.
+
+---
+
+## 5. Laragon-Style Dynamic Project Switcher
+
+### 5.1 Smart Framework Entrypoint Detection
+When switching the active project (via `⌘L`, Menu Bar, or CLI `xamppctl webroot <path>`):
+* If `<path>/public/index.php` exists (Laravel, Symfony, Bedrock), Apache DocumentRoot is automatically set to `<path>/public`.
+* If `<path>/web/index.php` exists (Yii, Drupal), DocumentRoot is set to `<path>/web`.
+* If standard `index.php` or `index.html` exists at root (WordPress, custom PHP), DocumentRoot is set to `<path>`.
+
+### 5.2 Finder Drag-and-Drop & Recent Projects Menu
+* **Dock Icon / Window Drop Target:** Developers can drag any project folder directly onto the `XamppControl` Dock icon or the Control Window. `AppDelegate.application(_:openFile:)` catches the URL, validates it, updates `stack.json`, triggers a graceful Apache reload (`httpd -k graceful`), and opens the local site in the browser in < 200ms.
+* **Recent Projects Menu:** Stores the last 5 active projects in `stack.json` and displays them in a dedicated Menu Bar submenu for instant switching.
+
+---
+
+## 6. Bundled Priority & Self-Healing Runtime
+
+### 6.1 Bundled CLI Priority Fix
+Inside `XamppCLI.swift`, ensure bundled resources take precedence when running inside `/Applications/XamppControl.app`:
+```swift
+if let bundledCli = Bundle.main.resourceURL?.appendingPathComponent("stack/bin/xamppctl").path,
+   FileManager.default.isExecutableFile(atPath: bundledCli) {
+    return bundledCli
+}
+```
+
+### 6.2 Self-Healing Defaults
+* If `stack.json` is missing or corrupted, `xamppctl` regenerates default configuration without throwing unhandled exceptions.
+* If `~/Sites/Xampp` does not exist on first run, it is automatically created and populated from `htdocs-template/index.php`.
+* Optional Terminal Integration: An in-app button ("Install xamppctl CLI Command") symlinks the executable to `~/.local/bin/xamppctl`.
+
+---
+
+## 7. Security & APFS Hardening
+
+1. **APFS Case-Insensitive Protection:**
+   * All Apache `<FilesMatch>` and `<DirectoryMatch>` rules enforce `(?i)` case-insensitivity:
+   * Protects against `.ENV`, `.SQL`, `.Git`, `.PHP`, `.SWP`, and `*~` source disclosure.
+2. **Symlink Traversal Defense:**
+   * Enforces `SymLinksIfOwnerMatch` across the active web root and virtual hosts to prevent arbitrary filesystem escapes.
+3. **Safe DocumentRoot Validation:**
+   * Strict path validation (`validate_docroot`) prevents setting DocumentRoot to sensitive user or system directories (`~`, `~/Library`, `/etc`, `/System`, `/usr`).
+4. **Database Name Sanitization:**
+   * Strict regex `^[A-Za-z0-9_][A-Za-z0-9_$-]{0,63}$` prevents command and SQL injection during database creation and imports.
+5. **Restricted Sockets & Tmp Storage:**
+   * All runtime directories (`run/`, `data/`, `tmp/phpmyadmin/`) are enforced with `chmod 0700` ownership.
+   * Socket paths are strictly validated to remain $\le 104$ bytes (macOS `sockaddr_un` limit).
+
+---
+
+## 8. Verification Protocol for Consumer Clean Macs
+
+To guarantee that any user downloading the DMG experiences a 100% flawless launch:
+
+| Test Case | Scenario | Expected Result |
+| :--- | :--- | :--- |
+| **TC-1: Brand New Mac** | Simulate completely fresh Mac (remove `~/Library/Application Support/XamppLocal`, no Homebrew on PATH). | Launching `XamppControl.app` opens the Onboarding Wizard; clicking Setup acquires PHP, MySQL, and phpMyAdmin; services start cleanly on port 8080/8081. |
+| **TC-2: Existing Homebrew Mac** | User has Homebrew PHP 8.4 already installed. | Onboarding Wizard detects existing PHP in < 1 second, reuses it without redundant download, and provisions MySQL. |
+| **TC-3: Port Collision** | Another service binds port 8080 (e.g., `nc -l 8080`). | XamppLocal identifies conflict, shifts Apache to port 8082, alerts user in GUI, and opens `http://127.0.0.1:8082`. |
+| **TC-4: Laravel Drag & Drop** | User drags a Laravel repository folder onto the Dock icon. | App detects `public/index.php`, sets DocumentRoot to `/public`, reloads Apache in < 200ms, and serves the Laravel application. |
+| **TC-5: MySQL to MariaDB Import** | User imports a MySQL dump with `utf8mb4_0900_ai_ci` into MariaDB. | Collation translator translates dump to `utf8mb4_unicode_ci` and imports without collation errors. |
+| **TC-6: Process Exit Watcher** | A service daemon is killed externally via `kill -9`. | `DispatchSource` exit watcher catches event instantly without polling loops and updates GUI status. |
+
+---
+
+## 9. Phased Implementation Roadmap
+
+* **Phase 1: CLI Dynamic Engine (`bin/xamppctl`)**
+  * Implement `xamppctl readiness` and `xamppctl bootstrap --json`.
+  * Implement multi-tier PHP engine discovery and standalone downloader.
+  * Implement intelligent port conflict detector and auto-reallocation.
+* **Phase 2: Swift AppKit Onboarding Wizard (`app/Sources/`)**
+  * Fix bundled CLI priority in `XamppCLI.swift`.
+  * Build `SetupSheetController` with animated `NSProgressIndicator` and status labels.
+  * Implement Finder drag-and-drop on Dock icon and Control Window.
+* **Phase 3: Database & Framework Switcher Polish**
+  * Add in-app MariaDB/PostgreSQL download sheets.
+  * Integrate automatic framework entrypoint detection (`public/`, `web/`).
+* **Phase 4: Build, Packaging & Distribution**
+  * Update `app/build.sh` and `make_dmg.sh` to package updated assets.
+  * Ad-hoc deep sign the application bundle.
+  * Test clean DMG install.
+* **Phase 5: Release & Verification**
+  * Run full test suite across all 6 verification test cases.
+  * Commit, tag `v1.1.0`, push to GitHub, and attach updated `XamppLocal.dmg` to GitHub Releases.

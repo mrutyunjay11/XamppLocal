@@ -12,6 +12,12 @@ final class XamppCLI {
            FileManager.default.isExecutableFile(atPath: envPath) {
             return envPath
         }
+        // Highest priority: Bundled CLI inside XamppControl.app/Contents/Resources/stack/bin/xamppctl
+        if let bundledCli = Bundle.main.resourceURL?.appendingPathComponent("stack/bin/xamppctl").path,
+           FileManager.default.isExecutableFile(atPath: bundledCli) {
+            return bundledCli
+        }
+        // Development mode: walk up parent directories from bundle location
         var dir = Bundle.main.bundleURL.deletingLastPathComponent()
         for _ in 0..<5 {
             let candidate = dir.appendingPathComponent("bin/xamppctl").path
@@ -23,10 +29,6 @@ final class XamppCLI {
         let desktopCli = (NSHomeDirectory() as NSString).appendingPathComponent("Desktop/Xampp/bin/xamppctl")
         if FileManager.default.isExecutableFile(atPath: desktopCli) {
             return desktopCli
-        }
-        if let bundledCli = Bundle.main.resourceURL?.appendingPathComponent("stack/bin/xamppctl").path,
-           FileManager.default.isExecutableFile(atPath: bundledCli) {
-            return bundledCli
         }
         return desktopCli
     }()
@@ -65,6 +67,54 @@ final class XamppCLI {
             } catch {
                 let result = CLIResult(exitCode: 1, stdout: "", stderr: error.localizedDescription)
                 DispatchQueue.main.async { completion(result) }
+            }
+        }
+    }
+
+    func runStreaming(_ args: [String], onLine: @escaping (String) -> Void, completion: @escaping (Int32) -> Void) {
+        queue.async {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            proc.arguments = ["python3", Self.cliPath] + args
+
+            var env = ProcessInfo.processInfo.environment
+            let existingPath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+            if !existingPath.contains("/opt/homebrew/bin") {
+                env["PATH"] = "/opt/homebrew/bin:/opt/homebrew/sbin:" + existingPath
+            }
+            proc.environment = env
+
+            let outPipe = Pipe()
+            let errPipe = Pipe()
+            proc.standardOutput = outPipe
+            proc.standardError = errPipe
+
+            var buffer = Data()
+            outPipe.fileHandleForReading.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                guard !chunk.isEmpty else { return }
+                buffer.append(chunk)
+                while let newlineRange = buffer.range(of: Data([0x0A])) {
+                    let lineData = buffer.subdata(in: 0..<newlineRange.lowerBound)
+                    buffer.removeSubrange(0..<newlineRange.upperBound)
+                    if let line = String(data: lineData, encoding: .utf8), !line.trimmingCharacters(in: .whitespaces).isEmpty {
+                        DispatchQueue.main.async { onLine(line) }
+                    }
+                }
+            }
+
+            do {
+                try proc.run()
+                proc.waitUntilExit()
+                outPipe.fileHandleForReading.readabilityHandler = nil
+                if !buffer.isEmpty, let line = String(data: buffer, encoding: .utf8), !line.trimmingCharacters(in: .whitespaces).isEmpty {
+                    DispatchQueue.main.async { onLine(line) }
+                }
+                let status = proc.terminationStatus
+                DispatchQueue.main.async { completion(status) }
+            } catch {
+                outPipe.fileHandleForReading.readabilityHandler = nil
+                DispatchQueue.main.async { completion(1) }
             }
         }
     }
@@ -111,4 +161,3 @@ final class XamppCLI {
         watchers.removeAll()
     }
 }
-

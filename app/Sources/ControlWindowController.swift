@@ -1,9 +1,51 @@
 import AppKit
 
+final class DragDropContentView: NSView {
+    weak var appDelegate: AppDelegate?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        registerForDraggedTypes([.fileURL])
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        registerForDraggedTypes([.fileURL])
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard let pasteboard = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL],
+              let first = pasteboard.first, first.hasDirectoryPath else {
+            return []
+        }
+        return .copy
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let pasteboard = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL],
+              let first = pasteboard.first, first.hasDirectoryPath else {
+            return false
+        }
+        appDelegate?.switchWebRoot(first.path, openInBrowser: true)
+        return true
+    }
+}
+
 final class ControlWindowController: NSWindowController, NSWindowDelegate {
     private weak var appDelegate: AppDelegate?
     private let logoView = NSImageView()
     private let summaryLabel = NSTextField(labelWithString: "Loading status...")
+
+    // Setup Wizard Box (Shown if stack is not ready)
+    private let setupBox = NSBox()
+    private let setupDescLabel = NSTextField(labelWithString: "One-click setup will acquire your Apple Silicon PHP engine, MySQL 8.4 LTS, and phpMyAdmin.")
+    private let setupChecklistLabel = NSTextField(labelWithString: "")
+    private let setupBtn = NSButton(title: "⚡ Set Up Local Stack (One-Click)", target: nil, action: nil)
+    private let setupProgress = NSProgressIndicator()
+    private let setupProgressLabel = NSTextField(labelWithString: "")
+
+    // Standard Stack Control Components
+    private let servicesStack = NSStackView()
     private let apacheLabel = NSTextField(labelWithString: "-")
     private let phpLabel = NSTextField(labelWithString: "-")
     private let dbLabel = NSTextField(labelWithString: "-")
@@ -15,6 +57,7 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
     private let dbBtn = NSButton(title: "Start", target: nil, action: nil)
 
     private let webRootLabel = NSTextField(labelWithString: "~/Sites/Xampp")
+    private let frameworkBadge = NSTextField(labelWithString: "")
     private let recentRootPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let browseRootBtn = NSButton(title: "Browse Folder...", target: nil, action: nil)
     private let dbPopup = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -29,7 +72,7 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
     init(appDelegate: AppDelegate) {
         self.appDelegate = appDelegate
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 570, height: 470),
+            contentRect: NSRect(x: 0, y: 0, width: 580, height: 500),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -46,19 +89,24 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     private func setupUI() {
-        guard let content = window?.contentView else { return }
+        guard let win = window else { return }
+        let container = DragDropContentView(frame: win.contentView?.bounds ?? .zero)
+        container.appDelegate = appDelegate
+        container.autoresizingMask = [.width, .height]
+        win.contentView = container
+
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .leading
         root.spacing = 12
         root.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 18, right: 20)
         root.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(root)
+        container.addSubview(root)
         NSLayoutConstraint.activate([
-            root.topAnchor.constraint(equalTo: content.topAnchor),
-            root.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            root.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            root.topAnchor.constraint(equalTo: container.topAnchor),
+            root.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            root.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: container.trailingAnchor),
         ])
 
         // Header with app logo + title/status
@@ -84,6 +132,51 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
         headerRow.addArrangedSubview(titleCol)
         root.addArrangedSubview(headerRow)
 
+        // Setup Box (Onboarding Wizard)
+        setupBox.title = "First-Run Setup Required"
+        setupBox.translatesAutoresizingMaskIntoConstraints = false
+        setupBox.widthAnchor.constraint(equalToConstant: 540).isActive = true
+        let setupContent = NSStackView()
+        setupContent.orientation = .vertical
+        setupContent.alignment = .leading
+        setupContent.spacing = 8
+        setupContent.edgeInsets = NSEdgeInsets(top: 10, left: 14, bottom: 12, right: 14)
+
+        setupDescLabel.font = .systemFont(ofSize: 12)
+        setupDescLabel.textColor = .labelColor
+        setupChecklistLabel.font = .monospacedSystemFont(ofSize: 11.5, weight: .regular)
+        setupChecklistLabel.textColor = .secondaryLabelColor
+
+        setupBtn.bezelStyle = .rounded
+        setupBtn.target = self
+        setupBtn.action = #selector(onRunSetup)
+
+        setupProgress.style = .bar
+        setupProgress.isIndeterminate = false
+        setupProgress.minValue = 0
+        setupProgress.maxValue = 100
+        setupProgress.widthAnchor.constraint(equalToConstant: 510).isActive = true
+        setupProgress.isHidden = true
+
+        setupProgressLabel.font = .systemFont(ofSize: 11)
+        setupProgressLabel.textColor = .secondaryLabelColor
+        setupProgressLabel.isHidden = true
+
+        setupContent.addArrangedSubview(setupDescLabel)
+        setupContent.addArrangedSubview(setupChecklistLabel)
+        setupContent.addArrangedSubview(setupBtn)
+        setupContent.addArrangedSubview(setupProgress)
+        setupContent.addArrangedSubview(setupProgressLabel)
+        setupBox.contentView = setupContent
+        setupBox.isHidden = true
+        root.addArrangedSubview(setupBox)
+
+        // Services Stack
+        servicesStack.orientation = .vertical
+        servicesStack.alignment = .leading
+        servicesStack.spacing = 12
+        servicesStack.translatesAutoresizingMaskIntoConstraints = false
+
         let topActions = NSStackView()
         topActions.spacing = 8
         masterBtn.bezelStyle = .rounded
@@ -94,15 +187,15 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
         topActions.addArrangedSubview(masterBtn)
         topActions.addArrangedSubview(refreshBtn)
         topActions.addArrangedSubview(doctorBtn)
-        root.addArrangedSubview(topActions)
+        servicesStack.addArrangedSubview(topActions)
 
-        root.addArrangedSubview(makeServiceRow(name: "Apache (httpd)", statusLabel: apacheLabel, button: apacheBtn, action: #selector(onApacheToggle)))
-        root.addArrangedSubview(makeServiceRow(name: "PHP-FPM (8.4)", statusLabel: phpLabel, button: phpBtn, action: #selector(onPHPToggle)))
-        root.addArrangedSubview(makeServiceRow(name: "Database", statusLabel: dbLabel, button: dbBtn, action: #selector(onDBToggle)))
+        servicesStack.addArrangedSubview(makeServiceRow(name: "Apache (httpd)", statusLabel: apacheLabel, button: apacheBtn, action: #selector(onApacheToggle)))
+        servicesStack.addArrangedSubview(makeServiceRow(name: "PHP-FPM (8.4)", statusLabel: phpLabel, button: phpBtn, action: #selector(onPHPToggle)))
+        servicesStack.addArrangedSubview(makeServiceRow(name: "Database", statusLabel: dbLabel, button: dbBtn, action: #selector(onDBToggle)))
 
         totalMemLabel.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
         totalMemLabel.textColor = .secondaryLabelColor
-        root.addArrangedSubview(totalMemLabel)
+        servicesStack.addArrangedSubview(totalMemLabel)
 
         // Laragon-style DocumentRoot folder selector
         let rootBox = NSStackView()
@@ -116,11 +209,18 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
         rootTitle.font = .systemFont(ofSize: 13, weight: .semibold)
         webRootLabel.font = .monospacedSystemFont(ofSize: 11.5, weight: .regular)
         webRootLabel.lineBreakMode = .byTruncatingMiddle
-        webRootLabel.widthAnchor.constraint(equalToConstant: 295).isActive = true
+        webRootLabel.widthAnchor.constraint(equalToConstant: 245).isActive = true
+
+        frameworkBadge.font = .systemFont(ofSize: 10.5, weight: .bold)
+        frameworkBadge.isBezeled = false
+        frameworkBadge.drawsBackground = false
+        frameworkBadge.isHidden = true
+
         browseRootBtn.target = self
         browseRootBtn.action = #selector(onBrowseRoot)
         pathRow.addArrangedSubview(rootTitle)
         pathRow.addArrangedSubview(webRootLabel)
+        pathRow.addArrangedSubview(frameworkBadge)
         pathRow.addArrangedSubview(browseRootBtn)
 
         let recentRow = NSStackView()
@@ -135,7 +235,7 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
 
         rootBox.addArrangedSubview(pathRow)
         rootBox.addArrangedSubview(recentRow)
-        root.addArrangedSubview(rootBox)
+        servicesStack.addArrangedSubview(rootBox)
 
         let dbRow = NSStackView()
         dbRow.spacing = 10
@@ -148,7 +248,7 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
         profilePopup.target = self
         profilePopup.action = #selector(onSelectProfile)
         dbRow.addArrangedSubview(profilePopup)
-        root.addArrangedSubview(dbRow)
+        servicesStack.addArrangedSubview(dbRow)
 
         let linksRow = NSStackView()
         linksRow.spacing = 8
@@ -161,12 +261,14 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
         linksRow.addArrangedSubview(pmaBtn)
         linksRow.addArrangedSubview(htdocsBtn)
         linksRow.addArrangedSubview(logsBtn)
-        root.addArrangedSubview(linksRow)
+        servicesStack.addArrangedSubview(linksRow)
 
         dockCheck.target = self
         dockCheck.action = #selector(onToggleDock)
         dockCheck.state = (appDelegate?.keepInDock ?? false) ? .on : .off
-        root.addArrangedSubview(dockCheck)
+        servicesStack.addArrangedSubview(dockCheck)
+
+        root.addArrangedSubview(servicesStack)
     }
 
     private func makeServiceRow(name: String, statusLabel: NSTextField, button: NSButton, action: Selector) -> NSView {
@@ -191,6 +293,24 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func update(status: StackStatus, busy: Bool) {
+        if let r = status.readiness, !r.isReady {
+            setupBox.isHidden = false
+            servicesStack.isHidden = true
+            let lines = [
+                "• Apache (httpd): \(r.apacheReady ? "Ready" : "Missing (/usr/sbin/httpd)")",
+                "• PHP 8.4 Runtime: \(r.phpReady ? "Ready" : "Needs Acquisition")",
+                "• MySQL 8.4 LTS: \(r.mysqlReady ? "Ready" : "Needs Download (~150 MB)")",
+                "• phpMyAdmin 5.2: \(r.pmaReady ? "Ready" : "Needs Download (~14 MB)")",
+                "• Database Storage: \(r.dataReady ? "Ready" : "Needs Initialization")"
+            ]
+            setupChecklistLabel.stringValue = lines.joined(separator: "\n")
+            summaryLabel.stringValue = "Setup required before starting servers"
+            return
+        }
+
+        setupBox.isHidden = true
+        servicesStack.isHidden = false
+
         let anyRunning = status.services.apache.isRunning || status.services.phpFpm.isRunning || status.services.db.isRunning
         summaryLabel.stringValue = busy ? "Working..." : (anyRunning ? "Running on http://127.0.0.1:\(status.httpPort)" : "Stopped (0 MB background RAM)")
         masterBtn.title = anyRunning ? "Stop All" : "Start All"
@@ -224,8 +344,31 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
             : "Measured Footprint Total: 0.00 MB (all stopped)"
 
         webRootLabel.stringValue = status.webRoot
-        webRootLabel.toolTip = status.webRoot
+        webRootLabel.toolTip = "Raw: \(status.webRoot)\nEffective: \(status.effectiveWebRoot ?? status.webRoot)"
         browseRootBtn.isEnabled = !busy
+
+        if let fw = status.framework, fw != "standard" {
+            frameworkBadge.isHidden = false
+            if fw == "laravel" {
+                frameworkBadge.stringValue = "[Laravel]"
+                frameworkBadge.textColor = .systemRed
+                frameworkBadge.toolTip = "Laravel detected: DocumentRoot mapped to public/"
+            } else if fw == "symfony" {
+                frameworkBadge.stringValue = "[Symfony]"
+                frameworkBadge.textColor = .systemBlue
+                frameworkBadge.toolTip = "Symfony detected: DocumentRoot mapped to public/"
+            } else if fw == "wordpress" {
+                frameworkBadge.stringValue = "[WordPress]"
+                frameworkBadge.textColor = .systemTeal
+                frameworkBadge.toolTip = "WordPress detected"
+            } else {
+                frameworkBadge.stringValue = "[\(fw.capitalized)]"
+                frameworkBadge.textColor = .systemOrange
+                frameworkBadge.toolTip = "Framework detected"
+            }
+        } else {
+            frameworkBadge.isHidden = true
+        }
 
         recentRootPopup.removeAllItems()
         recentPaths = status.recentWebRoots ?? [status.webRoot]
@@ -264,6 +407,24 @@ final class ControlWindowController: NSWindowController, NSWindowDelegate {
         let pidPart = svc.pid.map { "PID \($0)" } ?? "-"
         let memPart = svc.footprintMb > 0 ? String(format: " | %.1f MB", svc.footprintMb) : ""
         return "\(svc.status) (\(pidPart))\(memPart)"
+    }
+
+    @objc private func onRunSetup() {
+        setupBtn.isEnabled = false
+        setupProgress.isHidden = false
+        setupProgressLabel.isHidden = false
+        setupProgress.doubleValue = 5
+        setupProgressLabel.stringValue = "Starting stack acquisition..."
+
+        appDelegate?.runBootstrap(onProgress: { [weak self] prog in
+            self?.setupProgress.doubleValue = Double(prog.percent)
+            self?.setupProgressLabel.stringValue = "\(prog.percent)% — \(prog.message)"
+        }, onComplete: { [weak self] success, msg in
+            self?.setupBtn.isEnabled = true
+            if !success {
+                self?.setupProgressLabel.stringValue = "Setup Failed: \(msg)"
+            }
+        })
     }
 
     @objc private func onMasterToggle() { appDelegate?.toggleAll() }

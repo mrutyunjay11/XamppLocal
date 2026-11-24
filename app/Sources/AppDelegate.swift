@@ -116,6 +116,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return true
     }
 
+    func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        guard let first = filenames.first else { return }
+        switchWebRoot(first, openInBrowser: true)
+    }
+
+    func application(_ sender: NSApplication, openFile filename: String) -> Bool {
+        switchWebRoot(filename, openInBrowser: true)
+        return true
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         // Never auto-stop running servers on app quit; long-running projects stay alive unless explicitly stopped.
         cli.cancelAllWatchers()
@@ -140,6 +150,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 self.rebuildMenu()
                 self.windowController?.update(status: status, busy: self.busy)
+                if let r = status.readiness, !r.isReady, self.windowController == nil {
+                    self.openControlWindow()
+                }
             case .failure(let err):
                 self.rebuildMenu(error: err.localizedDescription)
             }
@@ -209,6 +222,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         header.isEnabled = false
         menu.addItem(header)
         menu.addItem(.separator())
+
+        if let r = st?.readiness, !r.isReady {
+            let setupItem = NSMenuItem(title: "⚠️ Setup Required (Click to Set Up)", action: #selector(openControlWindow), keyEquivalent: "")
+            setupItem.target = self
+            menu.addItem(setupItem)
+            menu.addItem(.separator())
+        }
 
         let master = NSMenuItem(title: anyRunning ? "Stop All Services" : "Start All Services", action: #selector(menuToggleAll), keyEquivalent: "s")
         master.target = self
@@ -350,6 +370,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.refreshStatus(includeMemory: self.windowController != nil)
             completion?(res)
         }
+    }
+
+    func runBootstrap(onProgress: @escaping (BootstrapProgress) -> Void, onComplete: @escaping (Bool, String) -> Void) {
+        busy = true
+        updateMenuIcon(running: false)
+        var lastMsg = "Completed"
+        cli.runStreaming(["bootstrap", "--json"], onLine: { line in
+            guard let data = line.data(using: .utf8),
+                  let prog = try? JSONDecoder().decode(BootstrapProgress.self, from: data) else { return }
+            lastMsg = prog.message
+            onProgress(prog)
+        }, completion: { [weak self] code in
+            guard let self else { return }
+            self.busy = false
+            let success = (code == 0)
+            self.refreshStatus(includeMemory: self.windowController != nil)
+            onComplete(success, success ? "Stack setup complete!" : "Setup failed: \(lastMsg)")
+        })
     }
 
     func toggleAll() {
